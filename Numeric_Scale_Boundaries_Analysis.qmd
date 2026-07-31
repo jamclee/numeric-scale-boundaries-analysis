@@ -1,0 +1,3140 @@
+---
+title: "Numeric Scale Boundaries: Analysis"
+subtitle: "Numeric scale formats only (1-5, 1-6, 1-10, 0-100) \u2014 bot-detection exclusions, DTI scoring, and pre-registered mixed-effects models"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+    theme: cosmo
+    fig-width: 6.8
+    fig-height: 4.4
+    fig-cap-location: top
+    tbl-cap-location: top
+execute:
+  warning: false
+  message: false
+jupyter: python3
+---
+
+## Overview
+
+This document analyzes the complete Scale Boundaries data (`full_data_07.29.26.csv`,
+N = 803 in the four numeric conditions (the full planned sample was 1,200 across
+six formats, minus 3 rows removed for apparent
+data-recording issues, 193-203 per scale-format condition against a target of 200)
+following the design and analysis plan laid out in *Scale Boundaries
+Pre-registration.docx*. It covers, in order:
+
+1. **Data preparation** — condition recoding, rounding, and rescaling to the 0-1
+   metric specified in the pre-registration.
+2. **Bot-detection exclusions** — counts for each criterion and how they overlap.
+3. **Descriptives** — distribution, spread, and skew of every boundary measure.
+4. **Model setup and fitting** — the reshapes and the six pre-registered
+   mixed-effects models, each fit twice (full sample and bot-excluded sample).
+5. **Model diagnostics** — residual plots and the assumption checks, run *before*
+   any result is interpreted, plus a robustness check showing whether the
+   assumptions actually matter for the conclusions.
+6. **H1-H3 results** — boundary position and neutral width, ending with the
+   estimated marginal means and Tukey letter groupings that say which specific
+   contexts and formats differ from which.
+7. **H4-H6 results** — zone asymmetry, ending with each scale drawn to scale.
+8. **All six hypotheses at a glance.**
+9. **Dichotomous Thinking Inventory** (Oshio, 2009) — scored using its published
+   3-factor structure, then tested as an exploratory predictor of neutral width.
+10. **Encounter and use across business contexts** — whether reported familiarity
+    varies by context.
+
+Sections 9-10 are supplementary: neither feeds the H1-H6 models, and both are
+scored here only for the exploratory moderator analyses the pre-registration
+mentions, which is why they sit after the confirmatory results rather than before
+them.
+
+Sections 3-5 are deliberately ordered so the data are described, the models are
+fit, and their assumptions are checked *before* §6 starts interpreting anything.
+
+### The six pre-registered hypotheses
+
+Quoted directly from *Scale Boundaries Pre-registration.docx* (Hypothesis and
+Analyses sections), for reference alongside the models below:
+
+| # | DV | Tested effect | Description (pre-registration wording) |
+|---|---|---|---|
+| H1 | Boundaries & neutral width | Main (omnibus) effect of context | "The negative and positive boundary positions differ across business contexts." |
+| H2 | Boundaries & neutral width | Main (omnibus) effect of scale | "The negative and positive boundary positions differ by rating scale format." |
+| H3 | Boundaries & neutral width | Interaction effect of context and scale | "The effect of context on boundary position differs depending on rating scale format." |
+| H4 | Asymmetry | Intercept — mean asymmetry across contexts and scales | "The size of the negative zone differs from the size of the positive zone." |
+| H5 | Asymmetry | Main (omnibus) effect of context | "The degree of negative/positive zone-size asymmetry differs across business contexts." |
+| H6 | Asymmetry | Main (omnibus) effect of scale | "The degree of negative/positive zone-size asymmetry differs depending on rating scale format." |
+
+H1-H3 are tested on the three boundary/width DVs — `negative_boundary_pct`,
+`positive_boundary_pct`, and `neutral_width_pct` ("Three linear mixed-effects
+models, one per DV") — while H4-H6 are all tested on the single asymmetry DV
+(`asym` = positive-zone size minus negative-zone size), in "One linear
+mixed-effects model."
+
+**Specification of H1-H3.** H1 and H2 are tested in **additive** models
+(`DV ~ context + condition`), with no context x scale interaction term; **H3** is
+tested in a separate model that *does* include the interaction, since H3 is the
+interaction term. See §4.3 for why this is the more precise operationalisation of
+the pre-registration.
+
+Exactly how each test is carried out — including why H4-H6 use a *paired
+difference* rather than a stacked zone factor, and why H4 gets its own
+intercept-only model — is explained in §4.2, §4.4, and §7.1.
+
+```{python}
+#| label: setup
+
+import numpy as np
+import pandas as pd
+from scipy import stats
+import statsmodels.formula.api as smf
+import matplotlib.pyplot as plt
+import seaborn as sns
+from matplotlib_venn import venn3
+import pingouin as pg
+from factor_analyzer import FactorAnalyzer
+from factor_analyzer.factor_analyzer import calculate_kmo, calculate_bartlett_sphericity
+
+# sklearn >=1.7 renamed force_all_finite -> ensure_all_finite; factor_analyzer
+# still calls the old name, so shim it here.
+import factor_analyzer.factor_analyzer as _fam
+_orig_check_array = _fam.check_array
+def _patched_check_array(*args, **kwargs):
+    if 'force_all_finite' in kwargs:
+        kwargs['ensure_all_finite'] = kwargs.pop('force_all_finite')
+    return _orig_check_array(*args, **kwargs)
+_fam.check_array = _patched_check_array
+
+pd.set_option("display.float_format", lambda v: f"{v:0.3f}")
+sns.set_theme(style="whitegrid", palette="colorblind")
+
+DATA_PATH = "full_data_07.29.26.csv"
+df = pd.read_csv(DATA_PATH)
+print(f"Loaded {len(df)} responses, {df.shape[1]} columns")
+```
+
+## 1. Data preparation
+
+This section details how certain fields were coded or transformed in preparation for the main analyses.
+
+### 1.1 Condition recoding
+
+`scale_condition` is recoded from its raw character labels into an ordered integer
+field, `condition`, as specified. **This document analyses the four numeric formats
+only**; participants assigned to the two categorical formats (`AF` = F to A+,
+`PE` = Poor to Excellent) are dropped at this step and appear nowhere below.
+
+| `scale_condition` | `condition` | Format |
+|---|---|---|
+| 5 | 1 | 1-5 |
+| 6 | 2 | 1-6 |
+| 10 | 3 | 1-10 |
+| 100 | 4 | 0-100 |
+
+```{python}
+#| label: tbl-recode-condition
+#| tbl-cap: "Participants per scale-format condition after recoding."
+
+cond_map = {'5': 1, '6': 2, '10': 3, '100': 4, 'AF': 5, 'PE': 6}
+cond_labels = {1: '1-5', 2: '1-6', 3: '1-10', 4: '0-100'}
+cond_order = ['1-5', '1-6', '1-10', '0-100']
+
+df['scale_condition'] = df['scale_condition'].astype(str)
+df['condition'] = df['scale_condition'].map(cond_map)
+
+# THIS DOCUMENT IS NUMERIC-FORMATS-ONLY: drop the two categorical conditions
+_n_all = len(df)
+df = df.loc[df['condition'].isin(cond_labels)].reset_index(drop=True)
+print(f"Dropped {_n_all - len(df)} participants in the categorical conditions "
+      f"(F to A+, Poor to Excellent); {len(df)} remain across four numeric formats.")
+
+df['condition_label'] = df['condition'].map(cond_labels)
+df['condition'].value_counts().sort_index().rename('n').to_frame()
+```
+
+### 1.2 Rescaling to the 0-1 metric
+
+Per the pre-registration, raw boundaries are rescaled to a common 0-1 metric to allow for cross-scale comparisons:
+
+$$\text{negative\_boundary\_pct} = \frac{\text{negative\_boundary} - \text{scale\_min}}{\text{scale\_max} - \text{scale\_min}}, \quad
+\text{positive\_boundary\_pct} = \frac{\text{positive\_boundary} - \text{scale\_min}}{\text{scale\_max} - \text{scale\_min}}$$
+
+$$\text{neutral\_width\_pct} = \text{positive\_boundary\_pct} - \text{negative\_boundary\_pct}$$
+
+```{python}
+#| label: tbl-rescale-pct
+#| tbl-cap: "Rescaled (0-1) boundary measures: summary statistics."
+
+boundary_cols = [
+    'restaurant_negative_boundary', 'restaurant_positive_boundary', 'restaurant_neutral_width',
+    'doctor_negative_boundary', 'doctor_positive_boundary', 'doctor_neutral_width',
+    'isp_negative_boundary', 'isp_positive_boundary', 'isp_neutral_width',
+]
+for c in boundary_cols:
+    df[c] = df[c].round(2)
+
+def get_scale_min(row):
+    return float(row['scale_min']) if row['scale_mode'] == 'numeric' else 1.0
+
+def get_scale_max(row):
+    # only numeric conditions survive the filter in 1.1
+    return float(row['scale_max'])
+
+df['scale_min_num'] = df.apply(get_scale_min, axis=1)
+df['scale_max_num'] = df.apply(get_scale_max, axis=1)
+
+for ctx in ['restaurant', 'doctor', 'isp']:
+    rng = df['scale_max_num'] - df['scale_min_num']
+    df[f'{ctx}_negative_boundary_pct'] = (df[f'{ctx}_negative_boundary'] - df['scale_min_num']) / rng
+    df[f'{ctx}_positive_boundary_pct'] = (df[f'{ctx}_positive_boundary'] - df['scale_min_num']) / rng
+    df[f'{ctx}_neutral_width_pct'] = df[f'{ctx}_positive_boundary_pct'] - df[f'{ctx}_negative_boundary_pct']
+
+pct_cols = [c for c in df.columns if c.endswith('_pct')]
+df[pct_cols].describe().T[['count', 'mean', 'std', 'min', 'max']]
+```
+
+## 2. Bot-detection exclusions
+
+This section applies the pre-registered bot-detection criteria, reports how many participants each one flags, and examines how the flagged participants differ from the rest of the sample.
+
+Three criteria, combined with OR:
+
+1. **Prompt-injection ("Golden Grove") item** — `fake_goldengrove == 1`.
+2. **Reverse-shibboleth ("apple juice") item** — near-correct answers on *all four*
+   nutrition sub-questions simultaneously (105-120 cal, 26-29g carbs, 0-0.5g fat,
+   0-1g protein).
+3. **Keystroke count** — `StrokeCount_AI < 10` on the open-ended question.
+
+```{python}
+#| label: bot-flags
+
+def to_num(s):
+    return pd.to_numeric(s, errors='coerce')
+
+df['flag_goldengrove'] = df['fake_goldengrove'] == 1
+
+v1 = to_num(df['multi_reverseshibb_1'])
+v2 = to_num(df['multi_reverseshibb_2'])
+v3 = to_num(df['multi_reverseshibb_3'])
+v4 = to_num(df['multi_reverseshibb_4'])
+df['flag_shibb_1'] = v1.between(105, 120)
+df['flag_shibb_2'] = v2.between(26, 29)
+df['flag_shibb_3'] = v3.between(0, 0.5)
+df['flag_shibb_4'] = v4.between(0, 1)
+df['flag_reverseshibb'] = df[['flag_shibb_1', 'flag_shibb_2', 'flag_shibb_3', 'flag_shibb_4']].all(axis=1)
+
+df['flag_strokecount'] = to_num(df['StrokeCount_AI']) < 10
+
+df['bot_flag'] = df['flag_goldengrove'] | df['flag_reverseshibb'] | df['flag_strokecount']
+```
+
+### 2.1 Counts per criterion
+
+```{python}
+#| label: tbl-bot-counts
+#| tbl-cap: "Participants flagged by each bot-detection criterion."
+
+n = len(df)
+counts = pd.DataFrame({
+    'criterion': [
+        'Selecting "Golden Grove"',
+        'Demonstrating superhuman knowledge',
+        '< 10 keystrokes for open-ended response',
+        'Total (ANY of the above)',
+    ],
+    'n_flagged': [
+        df['flag_goldengrove'].sum(),
+        df['flag_reverseshibb'].sum(),
+        df['flag_strokecount'].sum(),
+        df['bot_flag'].sum(),
+    ],
+})
+counts['pct_of_sample'] = (counts['n_flagged'] / n * 100).round(1)
+counts
+```
+
+```{python}
+#| label: tbl-shibb-subitem-breakdown
+#| tbl-cap: "Reverse-shibboleth sub-items: participants answering within the near-correct range on each item individually (105-120 calories, 26-29 g carbohydrates, 0-0.5 g fat, 0-1 g protein)."
+
+shibb_breakdown = pd.DataFrame({
+    'sub-item': ['Calories', 'Carbohydrates (g)', 'Fat (g)', 'Protein (g)'],
+    'n_in_range': [df['flag_shibb_1'].sum(), df['flag_shibb_2'].sum(),
+                   df['flag_shibb_3'].sum(), df['flag_shibb_4'].sum()],
+})
+shibb_breakdown['pct_of_sample'] = (shibb_breakdown['n_in_range'] / n * 100).round(1)
+shibb_breakdown
+```
+
+Individually, each apple-juice sub-item is in-range for a sizeable chunk of the
+sample (this is a plausible-guessing task, so that's expected) — it's landing in
+range on **all four simultaneously** that is the improbable, bot-like signature the
+pre-registration targets. Only 21 participants meet that bar.
+
+```{python}
+#| label: exclusion-n
+
+n_excluded = df['bot_flag'].sum()
+n_remaining = (~df['bot_flag']).sum()
+print(f"Full sample: N = {n}")
+print(f"Flagged as bot-like: N = {n_excluded} ({n_excluded/n*100:.1f}%)")
+print(f"Bot-excluded analytic sample: N = {n_remaining}")
+```
+
+::: {.callout-note collapse="true"}
+## Exploratory: how the three bot-detection criteria overlap
+
+```{python}
+#| label: fig-venn
+#| fig-cap: "Overlap among the three bot-detection criteria"
+
+gg = set(df.index[df['flag_goldengrove']])
+rs = set(df.index[df['flag_reverseshibb']])
+sc = set(df.index[df['flag_strokecount']])
+
+fig, ax = plt.subplots(figsize=(5.2, 5.2))
+venn3([gg, rs, sc], set_labels=('Golden Grove', 'Reverse-shibboleth', 'StrokeCount < 10'), ax=ax)
+ax.set_title('Overlap of bot-detection flags')
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+#| label: tbl-overlap-table
+#| tbl-cap: "Overlap between the three bot-detection criteria."
+
+overlap = pd.DataFrame({
+    'combination': [
+        'Golden Grove only', 'Reverse-shibboleth only', 'StrokeCount only',
+        'Golden Grove & Reverse-shibboleth', 'Golden Grove & StrokeCount',
+        'Reverse-shibboleth & StrokeCount', 'All three', 'Any (union)',
+    ],
+    'n': [
+        len(gg - rs - sc), len(rs - gg - sc), len(sc - gg - rs),
+        len((gg & rs) - sc), len((gg & sc) - rs),
+        len((rs & sc) - gg), len(gg & rs & sc), len(gg | rs | sc),
+    ],
+})
+overlap
+```
+
+The three criteria **diverge** rather than converge: of the 88 participants flagged
+by at least one criterion, none are flagged by all three, and only 7 are flagged by
+more than one. Each criterion appears to be catching a largely distinct kind of
+low-quality/bot-like response rather than all three triangulating on the same
+respondents. That's a reason to keep all three rather than treat any one as
+redundant.
+:::
+
+::: {.callout-note collapse="true"}
+## Exploratory: where the flagged participants fall on the DVs
+
+This subsection documents where the flagged participants fall on the DVs. There is
+no strong prior that they should differ systematically: the criteria key on
+behaviour during the attention and bot probes, not on how a person sets a rating
+boundary, and an exclusion rule that is unrelated to the DV but removes noisy
+responding is arguably the ideal case. The more diagnostic question is whether the
+flagged group adds **variance** — wider spread, more degenerate answers — which is
+what the plots and Table 6 below are checking. Green = passed all three checks, red
+= flagged by at least one.
+
+```{python}
+#| label: flag-long
+
+C_PASS, C_FAIL = '#4a9d5f', '#d6272e'
+
+flag_rows = []
+for ctx in ['restaurant', 'doctor', 'isp']:
+    tmp = df[['response_id', 'condition_label', 'bot_flag',
+              f'{ctx}_negative_boundary_pct', f'{ctx}_positive_boundary_pct',
+              f'{ctx}_neutral_width_pct']].copy()
+    tmp.columns = ['response_id', 'condition_label', 'bot_flag', 'neg', 'pos', 'width']
+    tmp['context'] = ctx
+    flag_rows.append(tmp)
+flag_long = pd.concat(flag_rows, ignore_index=True).dropna(subset=['neg', 'pos', 'width'])
+flag_long['status'] = np.where(flag_long['bot_flag'], 'flagged', 'passed')
+print(f"{len(flag_long)} observations; {flag_long['bot_flag'].sum()} from flagged participants "
+      f"({flag_long['bot_flag'].mean()*100:.1f}%)")
+```
+
+```{python}
+#| label: fig-flag-scatter
+#| fig-cap: "Negative vs. positive boundary for every participant x context observation, by scale format. Green = passed all bot checks, red = flagged by at least one. Vertical distance above the dashed diagonal is the neutral width; points *on* the diagonal have no neutral zone."
+#| fig-width: 6.8
+#| fig-height: 5.0
+
+fig, axes = plt.subplots(2, 3, figsize=(6.8, 5.0), sharex=True, sharey=True)
+for ax, fmt in zip(axes.flat, cond_order):
+    d = flag_long[flag_long['condition_label'] == fmt]
+    dp, dfl = d[~d['bot_flag']], d[d['bot_flag']]
+    ax.plot([0, 1], [0, 1], linestyle='--', color='grey', linewidth=0.8, zorder=1)
+    ax.scatter(dp['neg'], dp['pos'], s=10, alpha=0.40, color=C_PASS,
+               edgecolors='none', zorder=2)
+    ax.scatter(dfl['neg'], dfl['pos'], s=13, alpha=0.85, color=C_FAIL,
+               edgecolors='white', linewidths=0.25, zorder=3)
+    ax.set_title(f'{fmt}  (n flagged = {len(dfl)})', fontsize=8)
+    ax.set_xlim(-0.04, 1.04); ax.set_ylim(-0.04, 1.04)
+    ax.tick_params(labelsize=7)
+for ax in axes[1, :]:
+    ax.set_xlabel('Negative boundary', fontsize=8)
+for ax in axes[:, 0]:
+    ax.set_ylabel('Positive boundary', fontsize=8)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+#| label: fig-flag-strip
+#| fig-cap: "Marginal distribution of each DV, jittered, by scale format. Green = passed, red = flagged."
+#| fig-width: 6.8
+#| fig-height: 7.2
+
+fig, axes = plt.subplots(3, 1, figsize=(6.8, 7.2), sharex=True)
+for ax, (col, lab) in zip(axes, [('neg', 'Negative boundary'),
+                                 ('pos', 'Positive boundary'),
+                                 ('width', 'Neutral width')]):
+    sns.stripplot(data=flag_long[~flag_long['bot_flag']], x='condition_label', y=col,
+                  order=cond_order, ax=ax, color=C_PASS, size=3.0, alpha=0.38,
+                  jitter=0.32, zorder=1)
+    sns.stripplot(data=flag_long[flag_long['bot_flag']], x='condition_label', y=col,
+                  order=cond_order, ax=ax, color=C_FAIL, size=3.8, alpha=0.85,
+                  jitter=0.32, zorder=3, linewidth=0.25, edgecolor='white')
+    ax.set_ylabel(lab, fontsize=9)
+    ax.set_xlabel('')
+    ax.tick_params(axis='y', labelsize=8)
+axes[2].set_xlabel('Scale format')
+axes[2].tick_params(axis='x', rotation=30, labelsize=8)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+#| label: tbl-flag-compare-table
+#| tbl-cap: "Boundary and neutral-width DVs compared between participants who passed and who were flagged."
+
+cmp_rows = []
+for col, lab in [('neg', 'Negative boundary'), ('pos', 'Positive boundary'),
+                 ('width', 'Neutral width')]:
+    a = flag_long.loc[~flag_long['bot_flag'], col]
+    b = flag_long.loc[flag_long['bot_flag'], col]
+    lo10, hi90 = flag_long[col].quantile(0.10), flag_long[col].quantile(0.90)
+    cmp_rows.append({
+        'DV': lab,
+        'passed M': a.mean(), 'passed SD': a.std(),
+        'flagged M': b.mean(), 'flagged SD': b.std(),
+        "Cohen's d": (b.mean() - a.mean()) / np.sqrt((a.std()**2 + b.std()**2) / 2),
+        'passed in tails %': ((a <= lo10) | (a >= hi90)).mean() * 100,
+        'flagged in tails %': ((b <= lo10) | (b >= hi90)).mean() * 100,
+    })
+pd.DataFrame(cmp_rows).set_index('DV').round(3)
+```
+
+**What this shows.** The flagged participants are *not* a cleanly separated cluster
+— red points sit throughout the green cloud, and their means differ only modestly
+(|d| ≤ 0.24). What distinguishes them is **variance and extremity**: their SDs are
+larger on all three DVs, and they are markedly over-represented in the distribution
+tails (the last two columns above: 28-40% of flagged observations fall in the outer
+deciles versus 19-30% of passing ones, with the gap largest on neutral width —
+32.5% vs 19.1%).
+
+The same story shows up in the degenerate response patterns: among flagged
+observations 13.6% have a neutral width of exactly zero (vs 9.8% of passers), 6.1%
+have a width ≥ 0.9 — i.e. nearly the whole scale is "neutral" (vs 2.9%) — 12.9% put
+the negative boundary at the very floor (vs 6.7%) and 14.0% put the positive
+boundary at the very ceiling (vs 7.5%). That reads as careless or degenerate
+responding rather than a distinct population — which is the noise-reduction case
+for the exclusions, and also why the headline results in §6-§7 barely move when the
+flagged participants are dropped.
+:::
+
+## 3. Descriptive overview of the boundary measures
+
+This section describes the distribution, spread, and skew of each boundary measure across scale formats and business contexts.
+
+```{python}
+#| label: fig-descriptives
+#| fig-cap: "Rescaled (0-1) boundary positions by business context and scale format, bot-excluded sample. Shades of red = negative boundary, shades of green = positive boundary; darker = doctor, medium = isp, lighter = restaurant."
+#| fig-width: 6.8
+
+import matplotlib.colors as mcolors
+
+plot_df = df.loc[~df['bot_flag']].copy()
+long_desc = []
+for ctx in ['restaurant', 'doctor', 'isp']:
+    tmp = plot_df[['condition_label', f'{ctx}_negative_boundary_pct', f'{ctx}_positive_boundary_pct']].copy()
+    tmp = tmp.melt(id_vars='condition_label', var_name='boundary', value_name='pct')
+    tmp['boundary'] = tmp['boundary'].str.replace(f'{ctx}_', '').str.replace('_boundary_pct', '')
+    tmp['context'] = ctx
+    long_desc.append(tmp)
+long_desc = pd.concat(long_desc, ignore_index=True)
+
+cond_order = ['1-5', '1-6', '1-10', '0-100']
+
+# one consistent shade per context (darkest to lightest), applied within both the
+# red (negative) and green (positive) families so a shade always means the same context
+context_order = ['doctor', 'isp', 'restaurant']
+shade_vals = [0.85, 0.62, 0.42]
+red_map = {ctx: mcolors.to_hex(plt.cm.Reds(s)) for ctx, s in zip(context_order, shade_vals)}
+green_map = {ctx: mcolors.to_hex(plt.cm.Greens(s)) for ctx, s in zip(context_order, shade_vals)}
+
+long_desc['series'] = long_desc['context'] + ' ' + long_desc['boundary']
+palette = {}
+series_order = []
+for ctx in context_order:
+    palette[f'{ctx} negative'] = red_map[ctx]
+    series_order.append(f'{ctx} negative')
+for ctx in context_order:
+    palette[f'{ctx} positive'] = green_map[ctx]
+    series_order.append(f'{ctx} positive')
+
+fig, ax = plt.subplots(figsize=(6.8, 4.6))
+sns.pointplot(
+    data=long_desc, x='condition_label', y='pct', hue='series', hue_order=series_order,
+    order=cond_order, dodge=0.4, errorbar='se', ax=ax, palette=palette,
+)
+ax.set_xlabel('Scale format')
+ax.set_ylabel('Rescaled boundary (0-1)')
+ax.set_ylim(0, 1)
+ax.set_yticks(np.arange(0, 1.01, 0.1))
+ax.tick_params(axis='x', rotation=35)
+ax.legend(title=None, fontsize=8, ncol=2, loc='center left', bbox_to_anchor=(1.0, 0.5))
+plt.tight_layout()
+plt.show()
+```
+
+Two patterns are visible even before any modelling. First, **both boundaries sit
+higher for the doctor context than for restaurants or ISPs**, and they do so fairly
+consistently across all four scale formats — the dark red and dark green series run
+above their lighter counterparts almost everywhere. Second, because the axis now
+spans the full scale, the **area below the red lines is the negative zone and the
+area above the green lines is the positive zone**, so the two can be compared by
+eye: on all four formats the negative zone is clearly the larger of the two, and it
+stays that way throughout — no numeric format comes close to reversing the gap.
+These are the descriptive versions of the H1, H2, and H4-H6 results tested in
+§6-§7.
+
+```{python}
+#| label: fig-neutral-width
+#| fig-cap: "Neutral width (rescaled 0-1) by scale format and business context, bot-excluded sample"
+
+nw_long = []
+for ctx in ['restaurant', 'doctor', 'isp']:
+    tmp = plot_df[['condition_label', f'{ctx}_neutral_width_pct']].copy()
+    tmp.columns = ['condition_label', 'neutral_width_pct']
+    tmp['context'] = ctx
+    nw_long.append(tmp)
+nw_long = pd.concat(nw_long, ignore_index=True)
+
+fig, ax = plt.subplots(figsize=(6.5, 4.0))
+sns.pointplot(
+    data=nw_long, x='condition_label', y='neutral_width_pct', hue='context',
+    order=cond_order, dodge=0.3, errorbar='se', ax=ax,
+)
+ax.set_xlabel('Scale format')
+ax.set_ylabel('Neutral width (rescaled 0-1)')
+ax.tick_params(axis='x', rotation=35)
+plt.tight_layout()
+plt.show()
+```
+
+The three context lines sit close together and run roughly parallel across formats,
+and the format-to-format separation is modest: 1-10 carves out the widest neutral
+zone (≈0.26) and 1-5 the narrowest (≈0.23), a spread of only about 0.03 on the 0-1
+metric. That flatness is the descriptive version of the **non-significant** H2 result
+for `neutral_width_pct` in §6 — among numeric formats, scale granularity does not
+change how much room people leave in the middle.
+
+```{python}
+#| label: tbl-neutral-width-table
+#| tbl-cap: "Neutral width by scale format and context."
+
+nw_table = (
+    nw_long.groupby(['condition_label', 'context'])['neutral_width_pct']
+    .agg(['mean', 'std', 'median']).round(3)
+    .reindex(cond_order, level='condition_label')
+)
+nw_table
+```
+
+```{python}
+#| label: tbl-desc-table
+#| tbl-cap: "Boundary measures by context: means and SDs, full vs bot-excluded sample."
+
+desc_rows = []
+for ctx in ['restaurant', 'doctor', 'isp']:
+    for suffix, label in [('negative_boundary_pct', 'negative boundary'),
+                           ('positive_boundary_pct', 'positive boundary'),
+                           ('neutral_width_pct', 'neutral width')]:
+        col = f'{ctx}_{suffix}'
+        desc_rows.append({
+            'context': ctx, 'measure': label,
+            'mean_full': df[col].mean(), 'mean_excl': df.loc[~df['bot_flag'], col].mean(),
+            'sd_full': df[col].std(), 'sd_excl': df.loc[~df['bot_flag'], col].std(),
+        })
+pd.DataFrame(desc_rows)
+```
+
+Comparing the full and bot-excluded columns, the exclusions slightly reduce the
+standard deviation in every one of the nine cells (by 0.002 to 0.005 on the 0-1
+metric) while barely moving the means — the largest shift in any cell is 0.006.
+That is the noise-reduction pattern described in §2, and it is why the results in
+§6-§7 are essentially unchanged whether or not the flagged participants are
+included.
+
+### 3.1 Distribution of the H1-H3 DVs
+
+The figures above show only group means, which hide how much individual variation
+sits behind them. These boxplots show the full distribution of all three H1-H3 DVs —
+both boundaries and the neutral width — across every scale format x context cell, on
+the rescaled 0-1 metric so formats are comparable. Boxes are the IQR with the median
+line; the white diamond marks the mean.
+
+```{python}
+#| label: boundary-dist-long
+
+bd_long = []
+for ctx in ['restaurant', 'doctor', 'isp']:
+    for suffix, label in [('negative_boundary_pct', 'Negative boundary'),
+                          ('positive_boundary_pct', 'Positive boundary'),
+                          ('neutral_width_pct', 'Neutral width')]:
+        tmp = plot_df[['condition_label', f'{ctx}_{suffix}']].copy()
+        tmp.columns = ['condition_label', 'value']
+        tmp = tmp.dropna(subset=['value'])
+        tmp['context'] = ctx
+        tmp['boundary'] = label
+        bd_long.append(tmp)
+bd_long = pd.concat(bd_long, ignore_index=True)
+print(f"{len(bd_long)} observations across "
+      f"{bd_long['condition_label'].nunique()} formats x {bd_long['context'].nunique()} contexts x 3 DVs")
+```
+
+```{python}
+#| label: fig-boundary-box
+#| fig-cap: "Distribution of the three H1-H3 DVs by scale format and business context, bot-excluded sample, on the rescaled 0-1 metric. Boxes show the IQR and median; white diamonds mark the mean."
+#| fig-width: 6.8
+#| fig-height: 8.8
+
+fig, axes = plt.subplots(3, 1, figsize=(6.8, 8.8), sharex=True)
+for ax, bnd in zip(axes, ['Negative boundary', 'Positive boundary', 'Neutral width']):
+    d = bd_long[bd_long['boundary'] == bnd]
+    sns.boxplot(data=d, x='condition_label', y='value', hue='context', order=cond_order,
+                ax=ax, fliersize=1.5, linewidth=0.8,
+                showmeans=True,
+                meanprops={'marker': 'D', 'markerfacecolor': 'white',
+                           'markeredgecolor': 'black', 'markersize': 3.5})
+    ax.set_title(bnd, fontsize=10)
+    ax.set_ylabel('Rescaled position (0-1)', fontsize=9)
+    ax.set_xlabel('')
+    ax.set_ylim(-0.03, 1.03)
+    ax.tick_params(axis='y', labelsize=8)
+    ax.legend_.remove() if ax.legend_ else None
+axes[2].set_xlabel('Scale format')
+axes[2].tick_params(axis='x', rotation=30, labelsize=8)
+h, l = axes[0].get_legend_handles_labels()
+axes[0].legend(h, l, title='context', fontsize=8, title_fontsize=8, loc='lower left')
+plt.tight_layout()
+plt.show()
+```
+
+**What this shows.** Individual variation is large relative to the effects being
+tested. Boundary SDs run roughly 0.14-0.22 on a 0-1 metric, which puts the **context**
+effect — about 0.03 between doctor and isp — at roughly **0.13 SD**: reliable, as §6
+confirms, but small next to how much people differ from one another. Restricted to
+the four numeric formats the **format** effect is no longer dramatically larger: the
+negative boundary runs only from 0.476 on 0-100 down to 0.420 on 1-6, a spread of
+about **0.3 SD**. Much of the format effect reported in the six-format analysis came
+from the two categorical scales, which are absent here. Every group mean in Figure 4
+sits on top of this much person-to-person variability.
+
+### 3.2 Midpoint of the neutral zone
+
+This isn't one of the pre-registered DVs — it's a supplementary measure defined
+as requested: the **center of the neutral zone**,
+`midpoint_pct = (negative_boundary_pct + positive_boundary_pct) / 2`, on the same
+rescaled 0-1 metric as everything else. It answers a different question than
+`neutral_width_pct` does: width says how *big* the neutral zone is; midpoint says
+*where* it's centered — i.e., what people implicitly treat as "the middle" of a
+given scale, which need not be the scale's literal numeric midpoint (0.5).
+
+```{python}
+#| label: midpoint-pct
+
+for ctx in ['restaurant', 'doctor', 'isp']:
+    df[f'{ctx}_midpoint_pct'] = (df[f'{ctx}_negative_boundary_pct'] + df[f'{ctx}_positive_boundary_pct']) / 2
+
+plot_df = df.loc[~df['bot_flag']].copy()
+mid_long = []
+for ctx in ['restaurant', 'doctor', 'isp']:
+    tmp = plot_df[['condition_label', f'{ctx}_midpoint_pct']].copy()
+    tmp.columns = ['condition_label', 'midpoint_pct']
+    tmp['context'] = ctx
+    mid_long.append(tmp)
+mid_long = pd.concat(mid_long, ignore_index=True)
+```
+
+```{python}
+#| label: fig-midpoint
+#| fig-cap: "Midpoint of the neutral zone (rescaled 0-1) by scale format and business context, bot-excluded sample. Dashed line = the scale's literal numeric midpoint."
+
+fig, ax = plt.subplots(figsize=(6.5, 4.0))
+sns.pointplot(
+    data=mid_long, x='condition_label', y='midpoint_pct', hue='context',
+    order=cond_order, dodge=0.3, errorbar='se', ax=ax,
+)
+ax.axhline(0.5, color='grey', linestyle='--', linewidth=1, label='Scale midpoint (0.5)')
+handles, labels = ax.get_legend_handles_labels()
+ax.legend(handles, labels, title=None, fontsize=9)
+ax.set_xlabel('Scale format')
+ax.set_ylabel('Midpoint of neutral zone (0-1)')
+ax.tick_params(axis='x', rotation=35)
+plt.tight_layout()
+plt.show()
+```
+
+Two patterns stand out. **Within a scale format, across contexts:** doctor sits
+noticeably higher than restaurant and isp at almost every format (e.g. ≈0.61 vs.
+≈0.58-0.59 on 0-100, ≈0.59 vs. ≈0.54-0.55 on 1-10) — people place the "middle"
+of the doctor-rating scale a bit higher up than they do for restaurants or ISPs,
+consistent with the doctor-context asymmetry already seen in §7. **Across scale
+formats:** every context on every numeric format sits **above** the dashed 0.5 line,
+from 0.524 on 1-6 up to 0.612 on 0-100, with 1-6 consistently the closest to the
+true centre. So people's implicit "middle" is skewed a bit *generous* relative to
+the scale's literal center throughout (consistent with well-documented
+positivity-skewed rating behavior); nothing in the numeric family tips the other
+way.
+This tracks the same format-driven pattern already visible in the H2 boundary
+results and the asymmetry findings in §7 — it isn't a fully independent new
+signal, but it packages that pattern into a single, intuitive number.
+
+```{python}
+#| label: fig-midpoint-box
+#| fig-cap: "Distribution of the neutral-zone midpoint by scale format and business context, bot-excluded sample"
+#| fig-width: 6.8
+
+fig, ax = plt.subplots(figsize=(6.8, 4.4))
+sns.boxplot(
+    data=mid_long, x='condition_label', y='midpoint_pct', hue='context',
+    order=cond_order, ax=ax, fliersize=2,
+)
+ax.axhline(0.5, color='grey', linestyle='--', linewidth=1)
+ax.set_xlabel('Scale format')
+ax.set_ylabel('Midpoint of neutral zone (0-1)')
+ax.tick_params(axis='x', rotation=35)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+#| label: tbl-midpoint-table
+#| tbl-cap: "Neutral-zone midpoint by scale format and context."
+
+mid_table = (
+    mid_long.groupby(['condition_label', 'context'])['midpoint_pct']
+    .agg(['mean', 'std', 'median', 'count']).round(3)
+    .reindex(cond_order, level='condition_label')
+)
+mid_table
+```
+
+### 3.3 No neutral zone vs. a point vs. a range
+
+Everything above treats the neutral zone as a continuous width, but two special
+cases are worth separating out:
+
+- **No neutral zone at all** (`neutral_width == 0`): the negative and positive
+  boundary are the *same* value, so there is no neutral region — the scale is split
+  straight into negative and positive with nothing in between.
+- **A neutral "point"** (`neutral_width == one scale step`): the neutral region is
+  as narrow as that scale can possibly express — a single notch. In raw units that
+  means **width = 0.1** for the slider formats (1-5, 1-6, 1-10, whose step is 0.1)
+  and **width = 1** for the whole-unit format (0-100).
+- **A neutral "range"** (`neutral_width > one scale step`): an actual interval.
+
+```{python}
+#| label: tbl-point-vs-zone-table
+#| tbl-cap: "No neutral zone vs. a single-notch point vs. a wider range, by format and context."
+
+# raw-unit step size per scale format
+step_map = {1: 0.1, 2: 0.1, 3: 0.1, 4: 1.0, 5: 1.0, 6: 1.0}
+df['scale_step_num'] = df['condition'].map(step_map)
+plot_df = df.loc[~df['bot_flag']].copy()
+
+KIND_NONE, KIND_POINT, KIND_RANGE = 'none (width = 0)', 'point (width = 1 step)', 'range (width > 1 step)'
+kind_order = [KIND_NONE, KIND_POINT, KIND_RANGE]
+
+width_rows = []
+for ctx in ['restaurant', 'doctor', 'isp']:
+    tmp = plot_df[['condition_label', 'scale_step_num', f'{ctx}_neutral_width']].copy()
+    tmp.columns = ['condition_label', 'step', 'width']
+    tmp = tmp.dropna(subset=['width'])
+    tmp['context'] = ctx
+    width_rows.append(tmp)
+width_long = pd.concat(width_rows, ignore_index=True)
+
+width_long['kind'] = np.where(
+    np.isclose(width_long['width'], 0), KIND_NONE,
+    np.where(np.isclose(width_long['width'], width_long['step']), KIND_POINT, KIND_RANGE),
+)
+
+kind_counts = (
+    width_long.groupby(['condition_label', 'context'])['kind']
+    .value_counts().unstack(fill_value=0).reindex(columns=kind_order, fill_value=0)
+)
+kind_counts['n_total'] = kind_counts.sum(axis=1)
+for k in kind_order:
+    kind_counts[f'pct_{k.split()[0]}'] = (kind_counts[k] / kind_counts['n_total'] * 100).round(1)
+kind_counts = kind_counts.reindex(cond_order, level='condition_label')
+
+kind_counts
+```
+
+```{python}
+#| label: fig-point-vs-zone
+#| fig-cap: "Composition of neutral-zone responses by scale format, bot-excluded sample: share giving no neutral zone (width = 0), a single-notch point (width = 1 scale step), or a genuine zone (width > 1 step). Bars sum to 100%."
+#| fig-width: 6.8
+#| fig-height: 4.2
+
+# deliberately red / grey / blue — NOT the red/green used elsewhere for the
+# negative and positive zones, which is a different distinction
+C_NONE, C_POINT, C_ZONE = '#c0392b', '#9e9e9e', '#3b7dd8'
+
+comp = (
+    width_long.groupby('condition_label')['kind']
+    .value_counts(normalize=True).mul(100).unstack(fill_value=0)
+    .reindex(cond_order).reindex(columns=kind_order, fill_value=0)
+)
+
+fig, ax = plt.subplots(figsize=(6.8, 4.2))
+y = np.arange(len(cond_order))[::-1]
+left = np.zeros(len(cond_order))
+for kind, colour, lab in [(KIND_NONE, C_NONE, 'No neutral zone'),
+                          (KIND_POINT, C_POINT, 'Neutral point (1 step)'),
+                          (KIND_RANGE, C_ZONE, 'Neutral zone (>1 step)')]:
+    vals = comp[kind].values
+    alphas = [1.0] * len(cond_order)
+    for yi, v, l, a in zip(y, vals, left, alphas):
+        ax.barh(yi, v, left=l, height=0.62, color=colour, alpha=a, edgecolor='white')
+        if v >= 6:
+            ax.text(l + v / 2, yi, f'{v:.0f}%', ha='center', va='center',
+                    fontsize=8, color='#2b2b2b' if kind == KIND_POINT else 'white')
+    left += vals
+    ax.barh(np.nan, 0, color=colour, label=lab)   # legend proxy
+
+ax.set_yticks(y)
+ax.set_yticklabels(cond_order, fontsize=9)
+ax.set_xlim(0, 100)
+ax.set_xlabel('% of participant x context responses')
+ax.set_axisbelow(True)
+ax.xaxis.grid(True, alpha=0.3)
+ax.yaxis.grid(False)
+ax.legend(loc='lower center', bbox_to_anchor=(0.5, -0.34), ncol=3, frameon=False, fontsize=8)
+plt.tight_layout()
+plt.show()
+```
+
+Pooling everything: **9.8%** of context-responses have no neutral zone at all,
+**2.9%** have a single-notch neutral point, and **87.6%** have a genuine range —
+so roughly **1 in 8 (12.4%)** treat the boundary as essentially a dividing line
+rather than a zone.
+
+The stacked bars make the dominant pattern plain: a genuine neutral zone accounts
+for **82-91%** of responses on all four formats, and neither minority category ever
+becomes the story.
+
+Context barely matters (the "none" rate is 9.1% / 10.3% / 9.4% for
+doctor / isp / restaurant; "point" is 2.1-4.0%). Format matters somewhat, and only
+for one of the two minority categories:
+
+- **No neutral zone** is clearly highest on **1-5 (14.0%)** and lowest on 1-6 (7.8%)
+  and 1-10 (7.7%), with 0-100 at 9.1%. Chance collision cannot explain this: 1-5
+  offers 41 distinct slider values and 0-100 offers 91, so two independent picks
+  landing together should be rare. A rate of 14% instead looks like a deliberate
+  single-cutoff response style ("anything below X is bad, above is good"), and it is
+  most tempting on the coarsest-looking scale.
+- **Neutral point** is uniformly rare once the categorical scales are removed —
+  3.5% on 1-5, 1-6 and 0-100, and just 0.9% on 1-10. In the six-format analysis this
+  category was dominated by the two categorical formats; among numeric formats it is
+  a negligible response style rather than a real phenomenon.
+
+## 4. Main analyses: model setup and fitting
+
+This section reshapes the data for each set of hypotheses and fits the pre-registered mixed-effects models. Results are not interpreted here; that begins in §6, after the assumption checks in §5.
+
+Recall the design: business **context** (restaurant/doctor/isp) is
+within-subjects (everyone rates all three), scale **condition**/format is
+between-subjects (each participant is randomized to exactly one), and every model
+below carries a random intercept for participant, per the pre-registration. Every
+model is fit twice — full sample, then bot-excluded sample — so all six hypotheses
+can be compared with and without the flagged participants. All fitting happens in
+this section; results are interpreted in §6-§7 only after the diagnostics in §5.
+
+### 4.1 H1-H3 data: one row per participant x context
+
+```{python}
+#| label: reshape-long
+
+long_rows = []
+for ctx in ['restaurant', 'doctor', 'isp']:
+    tmp = df[['response_id', 'condition', 'bot_flag',
+              f'{ctx}_negative_boundary_pct', f'{ctx}_positive_boundary_pct', f'{ctx}_neutral_width_pct']].copy()
+    tmp.columns = ['response_id', 'condition', 'bot_flag', 'negative_boundary_pct', 'positive_boundary_pct', 'neutral_width_pct']
+    tmp['context'] = ctx
+    long_rows.append(tmp)
+long_df = pd.concat(long_rows, ignore_index=True)
+long_df = long_df.dropna(subset=['negative_boundary_pct', 'positive_boundary_pct', 'neutral_width_pct'])
+long_df['condition'] = long_df['condition'].astype('category')
+long_df['context'] = long_df['context'].astype('category')
+
+print(f"H1-H3 data: {long_df.shape[0]} rows ({long_df['response_id'].nunique()} participants x up to 3 contexts)")
+```
+
+### 4.2 H4-H6 data: a paired asymmetry score
+
+H4-H6 ask about the *balance* between the negative and positive zones (zone size =
+how much of the rescaled 0-1 range counts as that zone). The asymmetry is computed
+directly, once per participant x context:
+
+$$\text{asym} = \text{positive\_zone\_size} - \text{negative\_zone\_size} = (1 - \text{positive\_boundary\_pct}) - \text{negative\_boundary\_pct}$$
+
+Signed so that **negative values mean a larger negative zone** (people reserve more
+of the scale for "negative" than for "positive") and positive values mean a larger
+positive zone.
+
+Because `asym` is computed straight from the raw data, its variance already
+reflects however the two components actually relate to each other.
+
+```{python}
+#| label: tbl-asym-score
+#| tbl-cap: "Asymmetry score: summary statistics."
+
+long_df['asym'] = (1 - long_df['positive_boundary_pct']) - long_df['negative_boundary_pct']
+long_df[['asym']].describe().T[['count', 'mean', 'std', 'min', 'max']]
+```
+
+
+### 4.3 Fit H1-H2 (additive models) and H3 (interaction model)
+
+H1 and H2 are tested in **additive** models — no context x scale-format interaction
+term — fitted separately for each of the three DVs and on both samples.
+
+Conceptually, each DV is modelled as
+
+$$ \texttt{negative\_boundary} = a + b_1(\text{context}) + b_2(\text{scale}) + u + e $$
+
+$$ \texttt{positive\_boundary} = a + b_1(\text{context}) + b_2(\text{scale}) + u + e $$
+
+$$ \texttt{neutral\_width} = a + b_1(\text{context}) + b_2(\text{scale}) + u + e $$
+
+where $u$ is a random intercept for participant — each person contributes three
+observations, one per context — and $e$ is residual error.
+
+**H1** tests $b_1$ and **H2** tests $b_2$. Each is an *omnibus* test rather than a
+single coefficient: context has three levels and scale format six, so those terms
+carry 2 and 5 coefficients respectively, and the null is that all of them are zero
+at once.
+
+**H3** is the interaction, so it needs the saturated model, which adds a
+$b_3(\text{context} \times \text{scale})$ term. That model is fitted separately
+below and used for the H3 term only.
+
+Each omnibus test is reported as a **Wald chi-square** rather than an *F*. Testing
+whether a whole set of coefficients is jointly zero uses the quadratic form
+$\hat{b}'\hat{V}^{-1}\hat{b}$, which is distributed chi-square with degrees of
+freedom equal to the number of coefficients being tested (2 for context, 3 for
+format, 6 for the interaction). The chi-square rather than *F* reference
+distribution follows from `MixedLM` being fit by REML: once the variance components
+are estimated rather than known there is no exact finite-sample distribution for the
+fixed effects, which is why the coefficient tables in §7.2 report *z* rather than
+*t*, and why an *F* test would need a Satterthwaite or Kenward-Roger approximation
+to the denominator degrees of freedom. At N = 2,244 observations from 748
+participants the large-sample approximation is still comfortable.
+
+Note that a joint chi-square is not the sum of the individual squared *z* statistics.
+For `negative_boundary_pct`, the two context coefficients have $z = -3.48$ and
+$-3.19$, whose squares sum to 22.3, but H1 is reported as $\chi^2(2) = 14.89$. Both
+contrasts are taken against the same reference level, so their estimates are
+positively correlated; the quadratic form discounts that shared information, while
+summing the squares would double-count it.
+
+```{python}
+#| label: model-helpers
+
+def fit_mixedlm(formula, data, group_col='response_id', reml=True):
+    m = smf.mixedlm(formula, data=data, groups=data[group_col])
+    r = m.fit(reml=reml)
+    if not r.converged:
+        r = m.fit(reml=reml, method='powell')
+    return r
+
+def wald_table(result, label_map=None, drop_intercept=True):
+    wt = result.wald_test_terms(skip_single=False, scalar=True)
+    tbl = wt.table.copy()
+    tbl.columns = ['chi2', 'p', 'df']
+    tbl['chi2'] = tbl['chi2'].astype(float).round(2)
+    tbl['p'] = tbl['p'].astype(float)
+    if drop_intercept:
+        tbl = tbl.drop(index='Intercept', errors='ignore')
+    if label_map:
+        tbl.index = [label_map.get(i, i) for i in tbl.index]
+    return tbl[['df', 'chi2', 'p']]
+
+def fmt_p(p):
+    return '< .001' if p < .001 else f'{p:.3f}'
+
+samples = {'Full sample': long_df, 'Bot-excluded sample': long_df.loc[~long_df['bot_flag']]}
+```
+
+::: {.callout-important}
+## Why the specification matters for H1
+
+In a saturated fit the `C(context)` term is the context effect *at the reference
+format only* (the 1-5 scale, ~183 participants) — a conditional simple effect. In
+the additive model it is the context effect *averaged across all four formats*
+(748 participants). Same data, different estimand, and far more precision: for
+`negative_boundary_pct`, H1 is chi2(2) = 14.89, p < .001 in the additive model.
+
+Since H3 is non-significant for all three DVs — i.e. there is no evidence the
+context effect actually varies by format — the pooled additive estimate is the
+appropriate summary, and it matches how H1 is worded in the pre-registration
+("differ across business contexts," not "differ across contexts on the 1-5 scale").
+:::
+
+```{python}
+#| label: h1h3-fit
+
+h1h2_terms = {'C(context)': 'H1: context', 'C(condition)': 'H2: scale format'}
+dvs = ['negative_boundary_pct', 'positive_boundary_pct', 'neutral_width_pct']
+
+# --- primary: additive models (H1, H2) ---
+h1h3_results = {}
+h1h3_summary_rows = []
+for dv in dvs:
+    for sample_name, data in samples.items():
+        fit = fit_mixedlm(f"{dv} ~ C(context) + C(condition)", data)
+        h1h3_results[(dv, sample_name)] = fit
+        wt = wald_table(fit, h1h2_terms)
+        for term, row in wt.iterrows():
+            h1h3_summary_rows.append({
+                'DV': dv, 'sample': sample_name, 'term': term,
+                'df': int(row['df']), 'chi2': row['chi2'], 'p': row['p'],
+                'n_obs': int(fit.nobs), 'n_participants': data['response_id'].nunique(),
+            })
+
+# --- secondary: saturated models, used ONLY for the H3 interaction test ---
+h3_terms = {'C(context):C(condition)': 'H3: context x format'}
+h3_results = {}
+for dv in dvs:
+    for sample_name, data in samples.items():
+        fit = fit_mixedlm(f"{dv} ~ C(context) * C(condition)", data)
+        h3_results[(dv, sample_name)] = fit
+        wt = wald_table(fit, h3_terms)
+        wt = wt.loc[wt.index == 'H3: context x format']
+        for term, row in wt.iterrows():
+            h1h3_summary_rows.append({
+                'DV': dv, 'sample': sample_name, 'term': term,
+                'df': int(row['df']), 'chi2': row['chi2'], 'p': row['p'],
+                'n_obs': int(fit.nobs), 'n_participants': data['response_id'].nunique(),
+            })
+
+h1h3_summary = pd.DataFrame(h1h3_summary_rows)
+h1h3_summary['p_fmt'] = h1h3_summary['p'].apply(fmt_p)
+print(f"Fit {len(h1h3_results)} additive models (H1, H2) and {len(h3_results)} saturated models (H3 only).")
+```
+
+### 4.4 Fit H4-H6 (paired asymmetry score)
+
+All three hypotheses use the paired asymmetry score as the DV. Conceptually, two
+models are fitted:
+
+$$ \texttt{asym} = a + u + e $$
+
+$$ \texttt{asym} = a + b_1(\text{context}) + b_2(\text{scale}) + u + e $$
+
+where, as before, $u$ is a random intercept for participant and $e$ is residual
+error.
+
+- **H4** is the intercept $a$ of the **first** model — with no predictors, $a$ is
+  simply the mean asymmetry, averaged across all contexts and scale formats. H4 asks
+  whether it differs from zero.
+- **H5** tests $b_1$ and **H6** tests $b_2$ in the **second** model. As in §4.3 both
+  are omnibus tests, carrying 2 and 5 coefficients respectively.
+
+H4 gets its own model because in the second equation $a$ is no longer the overall
+mean — with treatment coding it becomes the asymmetry at the reference cell (doctor
+context, 1-5 scale), which is not the quantity H4 asks about.
+
+::: {.callout-note}
+## "Where did the zone interaction go?" — H5 and H6 *are* the interactions
+
+The pre-registration defines H5/H6 as the "zone-context" and
+"zone-scale_condition" **interactions**, so a formula with no interaction term in
+it looks wrong at first glance. It isn't — the interaction is still being tested,
+it's just been *reparameterised* into a main effect by the choice of DV.
+
+In the stacked formulation there are two rows per context (one per zone) and
+`zone_size` is the DV, so "does the neg-vs-pos gap depend on context" has to be
+written as `zone x context`. Here, the differencing has already been done *inside
+the DV*: `asym` **is** the neg-minus-pos gap. So asking "does that gap differ by
+context" is asking about a plain main effect of context on `asym`. Algebraically:
+
+$$\underbrace{\text{zone} \times \text{context}}_{\text{stacked model}} \;\equiv\; \underbrace{\text{context effect on (neg} - \text{pos)}}_{\text{this model}}$$
+
+Identical hypothesis, two equivalent parameterisations, which is why the choice
+between them is a matter of which assumptions you would rather not make rather than
+which answer you get. Likewise H4, "the zone
+main effect," becomes "is the mean of `asym` different from zero" — tested in its
+own intercept-only model so that it's a genuine average rather than a
+reference-cell value (see below).
+
+What is genuinely *not* in this model is a **context x scale-format** interaction
+(a three-way `zone x context x format` in stacked terms). The pre-registration
+never specified one for H4-H6 — its H4-H6 model lists only the zone main effect
+and the two two-way zone interactions — so none is fitted here, which also keeps
+this model's structure parallel to the now-additive H1/H2 models above.
+:::
+
+**H4 is fit as its own intercept-only model.** In the covariate model
+(`asym ~ context + condition`) with treatment coding, the intercept is the predicted
+asymmetry *at the reference cell only* — doctor context on the 1-5 scale — not the
+average. Since H4 asks whether there is asymmetry **on average across contexts and
+scales**, it gets a marginal model with no predictors at all:
+
+```
+asym ~ 1        (H4: is mean asymmetry different from zero?)
+asym ~ C(context) + C(condition)   (H5: context term; H6: scale-format term)
+```
+
+This matters for the *estimate*, not the verdict: the reference-cell intercept is
+-0.203, while the true average is -0.085 — doctor and 1-5 both happen to be
+high-asymmetry levels, so the reference-cell parameterisation overstates the typical
+asymmetry by roughly 2.4x. Both are significant, but only the second is the number
+to quote for "how asymmetric are people on average." The negative sign means the
+**negative zone is the larger one**: on average people give about 8.5 percentage
+points more of the rescaled scale to "negative" than to "positive."
+
+```{python}
+#| label: h456-fit
+
+# H4: marginal (intercept-only) model — mean asymmetry across all contexts & formats
+h4_results = {}
+h456_summary_rows = []
+for sample_name, data in samples.items():
+    fit = fit_mixedlm("asym ~ 1", data)
+    h4_results[sample_name] = fit
+    b, se = fit.params['Intercept'], fit.bse['Intercept']
+    h456_summary_rows.append({
+        'sample': sample_name, 'term': 'H4: mean asymmetry (across contexts & formats)',
+        'df': 1, 'chi2': round((b / se) ** 2, 2), 'p': fit.pvalues['Intercept'],
+        'n_obs': int(fit.nobs), 'n_participants': data['response_id'].nunique(),
+    })
+
+# H5 / H6: covariate model
+h456_terms = {'C(context)': 'H5: context', 'C(condition)': 'H6: scale format'}
+h456_results = {}
+for sample_name, data in samples.items():
+    fit = fit_mixedlm("asym ~ C(context) + C(condition)", data)
+    h456_results[sample_name] = fit
+    wt = wald_table(fit, h456_terms)
+    for term, row in wt.iterrows():
+        h456_summary_rows.append({
+            'sample': sample_name, 'term': term,
+            'df': int(row['df']), 'chi2': row['chi2'], 'p': row['p'],
+            'n_obs': int(fit.nobs), 'n_participants': data['response_id'].nunique(),
+        })
+
+h456_summary = pd.DataFrame(h456_summary_rows)
+h456_summary['p_fmt'] = h456_summary['p'].apply(fmt_p)
+print(f"Fit {len(h4_results)} intercept-only models (H4) and {len(h456_results)} covariate models (H5, H6).")
+```
+
+```{python}
+#| label: tbl-h4-estimate
+#| tbl-cap: "H4: mean asymmetry across contexts and scale formats."
+
+h4_rows = []
+for sample_name, fit in h4_results.items():
+    b, se = fit.params['Intercept'], fit.bse['Intercept']
+    ci = fit.conf_int().loc['Intercept']
+    # unweighted (cell-mean) version, as a balance check against the weighted mean above
+    fit_sum = fit_mixedlm("asym ~ C(context, Sum) + C(condition, Sum)", samples[sample_name])
+    h4_rows.append({
+        'sample': sample_name,
+        'mean_asym': round(b, 4), 'se': round(se, 4),
+        'ci_low': round(ci[0], 4), 'ci_high': round(ci[1], 4),
+        'p': fmt_p(fit.pvalues['Intercept']),
+        'unweighted_mean_asym': round(fit_sum.params['Intercept'], 4),
+    })
+pd.DataFrame(h4_rows)
+```
+
+The `unweighted_mean_asym` column re-estimates the same quantity as an unweighted
+average of cell means (sum-to-zero coding) rather than an average weighted by
+observed cell sizes. The two agree to within ~0.002, so the slightly unequal cell
+sizes aren't distorting the H4 estimate.
+
+### 4.5 Estimated marginal means and Tukey letter groupings
+
+The omnibus tests in §6 and §7 say *whether* a factor matters; the coefficient
+tables say how each level compares to whichever level happened to be the reference.
+Neither answers the question you usually want — **which levels actually differ from
+which**. This block computes that once for all four DVs; §6.3, §6.4, and §7.3 then
+report the results next to the hypothesis each one speaks to.
+
+For each fitted additive model it computes **estimated marginal means** (EMMs) per
+level — each level's mean with the *other* factor averaged out — then runs all
+pairwise comparisons with a **Tukey** adjustment for multiplicity, and summarises
+the result as a **compact letter display**:
+
+> **Levels that share a letter are not significantly different** (Tukey-adjusted
+> *p* ≥ .05). Levels with no letter in common do differ.
+
+So `0.469ᵃᵇ` and `0.429ᵇᶜ` share "b" → not distinguishable; `0.476ᵃ` and `0.420ᶜ`
+share nothing → different. Letters are assigned independently within each factor and
+each DV, so the "a" in one column has nothing to do with the "a" in another.
+
+```{python}
+#| label: emm-cld-helpers
+
+from scipy.stats import studentized_range
+
+SUP = {'a': 'ᵃ', 'b': 'ᵇ', 'c': 'ᶜ', 'd': 'ᵈ',
+       'e': 'ᵉ', 'f': 'ᶠ', 'g': 'ᵍ'}
+
+def emm_cld(fit, factor, levels, level_labels, other_factor, other_levels, alpha=0.05):
+    """Estimated marginal means, Tukey-adjusted pairwise tests, and a compact
+    letter display built from maximal cliques of the 'not different' graph.
+
+    In an additive treatment-coded model the other factor's averaged effect is a
+    constant that cancels out of every within-factor contrast, so the pairwise
+    estimates below are exact.
+    """
+    names = list(fit.fe_params.index)
+    idx = {n: i for i, n in enumerate(names)}
+    k = len(names)
+    col = lambda fac, lev: f'C({fac})[T.{lev}]'
+
+    # baseline vector: intercept + uniform average over the other factor's levels
+    base = np.zeros(k)
+    base[idx['Intercept']] = 1.0
+    for ol in other_levels:
+        c = col(other_factor, ol)
+        if c in idx:
+            base[idx[c]] += 1.0 / len(other_levels)
+
+    emm_rows = []
+    for lev in levels:
+        v = base.copy()
+        c = col(factor, lev)
+        if c in idx:
+            v[idx[c]] += 1.0
+        tt = fit.t_test(v.reshape(1, -1))
+        est, se = float(np.squeeze(tt.effect)), float(np.squeeze(tt.sd))
+        emm_rows.append({'level': level_labels[lev], 'emm': est, 'se': se,
+                         'ci_low': est - 1.96 * se, 'ci_high': est + 1.96 * se})
+    emm = pd.DataFrame(emm_rows)
+
+    pair_rows = []
+    for i in range(len(levels)):
+        for j in range(i + 1, len(levels)):
+            v = np.zeros(k)
+            for lev, sign in ((levels[i], 1.0), (levels[j], -1.0)):
+                c = col(factor, lev)
+                if c in idx:
+                    v[idx[c]] += sign
+            tt = fit.t_test(v.reshape(1, -1))
+            est, se = float(np.squeeze(tt.effect)), float(np.squeeze(tt.sd))
+            z = est / se
+            p = float(studentized_range.sf(np.sqrt(2) * abs(z), len(levels), 10 ** 6))
+            pair_rows.append({'a': level_labels[levels[i]], 'b': level_labels[levels[j]],
+                              'diff': est, 'se': se, 'z': z, 'p_tukey': min(p, 1.0)})
+    pairs = pd.DataFrame(pair_rows)
+
+    # compact letter display: one letter per maximal clique of non-significance
+    labs = [level_labels[l] for l in levels]
+    nonsig = {(a, b): True for a in labs for b in labs}
+    for _, r in pairs.iterrows():
+        flag = bool(r['p_tukey'] >= alpha)
+        nonsig[(r['a'], r['b'])] = flag
+        nonsig[(r['b'], r['a'])] = flag
+    adj = {a: {b for b in labs if b != a and nonsig[(a, b)]} for a in labs}
+
+    cliques = []
+    def bron_kerbosch(R, P, X):
+        if not P and not X:
+            cliques.append(set(R)); return
+        for v in list(P):
+            bron_kerbosch(R | {v}, P & adj[v], X & adj[v])
+            P = P - {v}; X = X | {v}
+    bron_kerbosch(set(), set(labs), set())
+
+    emm_by_lab = dict(zip(emm['level'], emm['emm']))
+    cliques.sort(key=lambda g: -max(emm_by_lab[m] for m in g))
+    letters = {a: '' for a in labs}
+    for gi, g in enumerate(cliques):
+        for lev in g:
+            letters[lev] += chr(ord('a') + gi)
+    emm['group'] = emm['level'].map(lambda l: ''.join(sorted(letters[l])))
+    emm['display'] = emm.apply(
+        lambda r: f"{r['emm']:.3f} ({r['se']:.3f})" + ''.join(SUP[c] for c in r['group']), axis=1)
+    return emm, pairs
+
+
+DV_LABELS = {
+    'negative_boundary_pct': 'Negative boundary',
+    'positive_boundary_pct': 'Positive boundary',
+    'neutral_width_pct': 'Neutral width',
+    'asym': 'Asymmetry (pos - neg)',
+}
+CTX_LEVELS = ['doctor', 'isp', 'restaurant']
+CTX_LABELS = {c: c for c in CTX_LEVELS}
+COND_LEVELS = [1, 2, 3, 4]
+
+emm_data = {}
+pair_data = {}
+_cld_sample = samples['Bot-excluded sample']
+for _dv in DV_LABELS:
+    _fit = fit_mixedlm(f"{_dv} ~ C(context) + C(condition)", _cld_sample)
+    emm_data[(_dv, 'context')], pair_data[(_dv, 'context')] = emm_cld(
+        _fit, 'context', CTX_LEVELS, CTX_LABELS, 'condition', COND_LEVELS)
+    emm_data[(_dv, 'condition')], pair_data[(_dv, 'condition')] = emm_cld(
+        _fit, 'condition', COND_LEVELS, cond_labels, 'context', CTX_LEVELS)
+print("Computed EMMs + Tukey CLD for", len(DV_LABELS), "DVs x 2 factors (bot-excluded sample).")
+```
+
+```{python}
+#| label: emm-plot-helpers
+
+H13_DVS = ['negative_boundary_pct', 'positive_boundary_pct', 'neutral_width_pct']
+
+def emm_panel(ax, dv, factor, order_, rot=15, lab_fs=8):
+    """One estimated-marginal-mean panel with 95% CIs and letter groupings."""
+    e = emm_data[(dv, factor)].set_index('level').reindex(order_).reset_index()
+    x = np.arange(len(e))
+    ax.errorbar(x, e['emm'], yerr=1.96 * e['se'], fmt='o', capsize=4, color='#1f77b4')
+    pad = (e['ci_high'].max() - e['ci_low'].min()) * 0.18 + 1e-9
+    for xi, r in zip(x, e.itertuples()):
+        ax.text(xi, r.ci_high + pad * 0.35, r.group, ha='center', va='bottom',
+                fontweight='bold', fontsize=10, color='crimson')
+    ax.set_xticks(x)
+    ax.set_xticklabels(e['level'], rotation=rot, ha='right', fontsize=lab_fs)
+    ax.set_ylim(e['ci_low'].min() - pad, e['ci_high'].max() + pad * 1.6)
+    ax.set_title(DV_LABELS[dv], fontsize=9)
+    ax.tick_params(axis='y', labelsize=8)
+    if dv == 'asym':
+        ax.axhline(0, color='grey', linestyle='--', linewidth=1)
+
+def pmat_panel(ax, dv, annot_fs=5.5):
+    """Lower-triangle heatmap of Tukey p-values between scale formats."""
+    pr = pair_data[(dv, 'condition')]
+    M = pd.DataFrame(np.nan, index=cond_order, columns=cond_order, dtype=float)
+    for _, r in pr.iterrows():
+        ia, ib = cond_order.index(r['a']), cond_order.index(r['b'])
+        lo, hi = (ia, ib) if ia > ib else (ib, ia)
+        M.iloc[lo, hi] = r['p_tukey']
+    sns.heatmap(M, annot=True, fmt='.3f', cmap='viridis_r', vmin=0, vmax=0.2,
+                cbar=False, ax=ax, annot_kws={'fontsize': annot_fs}, linewidths=0.5,
+                mask=M.isna())
+    ax.set_title(DV_LABELS[dv], fontsize=9)
+    ax.tick_params(axis='x', rotation=40, labelsize=6)
+    ax.tick_params(axis='y', rotation=0, labelsize=6)
+```
+
+::: {.callout-note}
+## Notes on method
+
+- **EMMs, not raw cell means** — each value averages the other factor out
+  uniformly, so unequal cell sizes don't tilt the comparison.
+- **Tukey adjustment** via the studentized-range distribution with asymptotic df
+  (3 comparisons per context set, 15 per scale-format set).
+- **Letters come from maximal cliques** rather than a greedy pass, so the display
+  is exact in both directions: sharing a letter means "not different," and *not*
+  sharing one means "different." Verified across all 72 comparisons.
+- **No interaction is involved** — these use the additive models, so each context
+  comparison pools across all four formats. Appropriate given H3 was non-significant
+  throughout; reinstating the interaction would make these tables format-specific.
+:::
+
+## 5. Model diagnostics
+
+This section checks whether the fitted models meet the assumptions of a linear mixed model, and tests whether the conclusions depend on those assumptions holding.
+
+The models are fitted in §4 but **nothing is interpreted until this section is
+clear** — §6 onward is where results get read.
+
+Each model is `DV ~ context + scale + (1 | participant)`, so the assumptions are
+those of a random-intercept linear mixed model. Stated in the terms of this study:
+
+| # | Assumption | What it means for these data | Checked in |
+|---|---|---|---|
+| A1 | **Homoskedasticity of residuals** | Residuals have the same variance everywhere. A response is no more spread out around its own predicted value on one scale format than another, in one business context than another, or at the low end of the scale than the high end. | §5.1 |
+| A2 | **Normally distributed residuals** | After accounting for context, scale format, and the participant's own offset, the leftover deviation in each response is normally distributed — symmetric, with no heavy tails. | §5.2 |
+| A3 | **Normally distributed random intercepts** | Each participant has a personal offset — a general tendency to place boundaries high or low across all three contexts — and those 748 offsets are normally distributed around the grand mean. | §5.3 |
+| A4 | **Conditional independence of residuals within participant** | Once a person's own offset is accounted for, their three context residuals are unrelated. Equivalently: any two of a person's three answers are equally correlated, whichever two you pick (compound symmetry). | §5.4 |
+| A5 | **Random intercepts unrelated to the predictors** | A participant's personal offset is not systematically tied to which scale format they were shown. | satisfied by design |
+| A6 | **Independence between participants** | One person's answers say nothing about another's. | satisfied by design |
+
+: Assumptions of the random-intercept model and where each is checked. {#tbl-assumptions}
+
+A5 and A6 need no empirical check. Scale format was **randomised between subjects**,
+so a participant's offset cannot be systematically related to the format they
+received; context is *within*-subject, so it is crossed with the random intercept
+rather than confounded with it. A6 follows from participants being independently
+recruited individuals.
+
+One thing deliberately *not* in that list is additivity — the assumption that
+context and scale format shift boundaries independently rather than interacting.
+The H1/H2 models are additive, so they do impose it, but it is not taken on faith:
+additivity is exactly what **H3 tests**, and H3 is non-significant for all three
+boundary DVs (largest chi2(6) = 11.94, p = .063; see §6.1). It is a verified
+precondition rather than an unchecked assumption, which is why it is handled by a
+hypothesis test rather than a diagnostic.
+
+§5.5 then does the thing that matters most: rather than arguing about whether any
+violation is "bad enough," it **refits everything without the normality assumption**
+and checks whether a conclusion moves.
+
+All four model types are checked (`negative_boundary_pct`, `positive_boundary_pct`,
+`neutral_width_pct`, and the `asym` model behind H4-H6). Plots use the bot-excluded
+sample — the one every coefficient table in this document is built on — while the
+statistics tables also carry the full sample for comparison.
+
+```{python}
+#| label: diagnostic-setup
+
+DV_DIAG_LABELS = {
+    'negative_boundary_pct': 'negative_boundary_pct',
+    'positive_boundary_pct': 'positive_boundary_pct',
+    'neutral_width_pct': 'neutral_width_pct',
+    'asym': 'asym (H4-H6)',
+}
+
+def diag_fit(dv, sample_name):
+    return (h456_results[sample_name] if dv == 'asym'
+            else h1h3_results[(dv, sample_name)])
+
+def diag_parts(fit):
+    resid = np.asarray(fit.resid)
+    fitted = np.asarray(fit.fittedvalues)
+    re_vals = np.array([float(v.iloc[0]) for v in fit.random_effects.values()])
+    return resid, fitted, re_vals
+
+diag_rows = []
+for _dv, _lab in DV_DIAG_LABELS.items():
+    for _sample in samples:
+        _fit = diag_fit(_dv, _sample)
+        _resid, _fitted, _re = diag_parts(_fit)
+        _s2e, _s2u = _fit.scale, _fit.cov_re.iloc[0, 0]
+        diag_rows.append({
+            'model': _lab, 'sample': _sample,
+            'n_obs': int(_fit.nobs), 'n_participants': len(_re),
+            'resid_sd': np.sqrt(_s2e), 're_sd': np.sqrt(_s2u),
+            'icc': _s2u / (_s2u + _s2e),
+            'resid_skew': stats.skew(_resid), 'resid_kurtosis': stats.kurtosis(_resid),
+            'shapiro_resid_p': stats.shapiro(pd.Series(_resid).sample(min(len(_resid), 5000), random_state=0)).pvalue,
+            'shapiro_re_p': stats.shapiro(_re).pvalue,
+            'converged': _fit.converged,
+        })
+diag_table = pd.DataFrame(diag_rows)
+print(f"Diagnostics computed for {len(DV_DIAG_LABELS)} models x {len(samples)} samples.")
+```
+
+### 5.1 Homoskedasticity (A1)
+
+A linear model assumes the residual variance is constant — the spread of residuals
+should look the same at every fitted value. The diagnostic is a residuals-vs-fitted
+plot, and the failure mode to look for is a **funnel**: residuals fanning out (or
+pinching in) as the fitted value rises.
+
+```{python}
+#| label: fig-diag-homosked
+#| fig-cap: "Residuals against fitted values, bot-excluded sample. Constant vertical spread across the x-axis indicates homoskedasticity; a fan or funnel shape would indicate a violation."
+#| fig-width: 6.8
+#| fig-height: 5.2
+
+fig, axes = plt.subplots(2, 2, figsize=(6.8, 5.2))
+for ax, (dv, lab) in zip(axes.flat, DV_DIAG_LABELS.items()):
+    resid, fitted, _ = diag_parts(diag_fit(dv, 'Bot-excluded sample'))
+    ax.scatter(fitted, resid, s=6, alpha=0.25, color='#4a7fb5', edgecolors='none')
+    ax.axhline(0, color='crimson', linewidth=1)
+    ax.set_title(lab, fontsize=9)
+    ax.tick_params(labelsize=7)
+for ax in axes[:, 0]:
+    ax.set_ylabel('Residual', fontsize=8)
+for ax in axes[1, :]:
+    ax.set_xlabel('Fitted value', fontsize=8)
+plt.tight_layout()
+plt.show()
+```
+
+**A1 is adequately met.** None of the four panels shows a fan or funnel — the
+vertical band of residuals is of broadly similar depth from the left of each plot to
+the right, which is what constant variance looks like.
+
+Two features are visible and neither is a genuine violation. First, the band
+*narrows* slightly at the extreme right for the two boundary DVs: when a fitted
+value approaches 1, a positive residual has nowhere left to go, so the outcome's
+[0,1] bound mechanically compresses the spread there. Second, the faint diagonal
+streaks are an artefact of the response scale being discrete while fitted values are
+continuous — every distinct raw response traces its own line. Both are properties of
+how the outcome is recorded rather than signs that the variance model is wrong.
+
+### 5.2 Normality of residuals (A2)
+
+The residuals are assumed normal. The diagnostic is a Q-Q plot: points should track
+the diagonal, with departures at the ends indicating heavy or light tails.
+
+```{python}
+#| label: fig-diag-resid-qq
+#| fig-cap: "Normal Q-Q plots of model residuals, bot-excluded sample. Points on the diagonal indicate normality; S-shaped or curved departures indicate skew or heavy tails."
+#| fig-width: 6.8
+#| fig-height: 5.2
+
+fig, axes = plt.subplots(2, 2, figsize=(6.8, 5.2))
+for ax, (dv, lab) in zip(axes.flat, DV_DIAG_LABELS.items()):
+    resid, _, _ = diag_parts(diag_fit(dv, 'Bot-excluded sample'))
+    stats.probplot(resid, dist='norm', plot=ax)
+    ax.set_title(lab, fontsize=9)
+    ax.set_xlabel('Theoretical quantiles', fontsize=8)
+    ax.set_ylabel('Ordered residuals', fontsize=8)
+    ax.tick_params(labelsize=7)
+    ax.get_lines()[0].set_markersize(2.5)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+#| label: tbl-diag-resid
+#| tbl-cap: "Residual distribution statistics by model and sample."
+
+diag_table[['model', 'sample', 'n_obs', 'resid_sd',
+            'resid_skew', 'resid_kurtosis', 'shapiro_resid_p']].round(3)
+```
+
+**A2 is met for the two boundary DVs and mildly violated for neutral width.**
+
+Shapiro-Wilk rejects normality for every model, but that is close to uninformative
+at N around 3,300 — the test flags trivial departures at this sample size, and a
+bounded, discretised outcome guarantees some departure regardless. The moments are
+the informative columns.
+
+For `negative_boundary_pct` (skew ≈ +0.31) and `positive_boundary_pct` (≈ -0.15) the
+Q-Q points track the diagonal closely through the body of the distribution and the
+skew is negligible — these are effectively symmetric once the model accounts for
+context and format, and noticeably tamer than the raw marginal distributions in
+§3.1, which pooled between-person variance together with the large format effects.
+
+`neutral_width_pct` is the genuine exception: skew ≈ +1.04 and kurtosis ≈ 4.4, and
+its Q-Q plot bends visibly upward at the right. That is expected from its
+construction — a difference of two bounded values with a hard floor at zero, so it
+has a long right tail. `asym` inherits a milder version (skew ≈ -0.34). Fixed-effect
+Wald tests are large-sample results and do not require normal residuals to be
+asymptotically valid; §5.5 confirms empirically that nothing here depends on it.
+
+### 5.3 Normality of the participant random intercepts (A3)
+
+This is a *separate* assumption from A2 and needs its own check. Substantively, the
+random intercept is each participant's **general tendency to set boundaries high or
+low**, shared across all three of their contexts — a personal strictness/generosity
+offset. The model assumes those 748 offsets are normally distributed
+around the grand mean, so the diagnostic is a Q-Q plot of the estimated intercepts
+rather than of the residuals.
+
+```{python}
+#| label: fig-diag-re-qq
+#| fig-cap: "Normal Q-Q plots of the estimated participant random intercepts, bot-excluded sample. Each point is one participant's overall offset from the grand mean."
+#| fig-width: 6.8
+#| fig-height: 5.2
+
+fig, axes = plt.subplots(2, 2, figsize=(6.8, 5.2))
+for ax, (dv, lab) in zip(axes.flat, DV_DIAG_LABELS.items()):
+    _, _, re_vals = diag_parts(diag_fit(dv, 'Bot-excluded sample'))
+    stats.probplot(re_vals, dist='norm', plot=ax)
+    ax.set_title(lab, fontsize=9)
+    ax.set_xlabel('Theoretical quantiles', fontsize=8)
+    ax.set_ylabel('Ordered intercepts', fontsize=8)
+    ax.tick_params(labelsize=7)
+    ax.get_lines()[0].set_markersize(2.5)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+#| label: tbl-diag-re
+#| tbl-cap: "Participant random-intercept statistics by model and sample."
+
+diag_table[['model', 'sample', 'n_participants', 're_sd', 'icc', 'shapiro_re_p']].round(3)
+```
+
+**A3 is adequately met.** The Q-Q plots run close to straight through the middle,
+with mild departure at both ends — a handful of participants are more extreme than a
+normal would predict. That is unsurprising: those are the people who put boundaries
+at the very floor or ceiling of the scale, which the [0,1] bound then caps.
+
+The **intraclass correlation (ICC)** in the table is the share of total variance
+that sits *between* participants rather than *within* them:
+
+$$ \text{ICC} = \frac{\sigma^2_u}{\sigma^2_u + \sigma^2_e} $$
+
+where $\sigma^2_u$ is the variance of the participant intercepts (the `re_sd` column
+squared) and $\sigma^2_e$ is the residual variance (`resid_sd` squared, in
+@tbl-diag-resid). Its complement, $1 - \text{ICC}$, is the *within*-participant
+share — the proportion of variance that comes from one person moving around across
+their three contexts.
+
+The ICC has a second reading that matters for §5.4: it is also the correlation the
+model implies between **any two responses from the same person**. The two readings
+coincide because two responses from the same participant share exactly one thing,
+that person's intercept, while their residuals do not overlap at all:
+
+$$ \text{Cov}(y_{ij},\, y_{ik}) = \sigma^2_u \qquad \text{Var}(y_{ij}) = \sigma^2_u + \sigma^2_e $$
+
+so their correlation is $\sigma^2_u / (\sigma^2_u + \sigma^2_e)$ — the ICC again.
+The *shared* variance component is exactly what makes two observations correlated,
+which is why "proportion of variance that is between-participant" and "correlation
+between two of a participant's responses" are the same number. Note that
+$1 - \text{ICC}$ is **not** a within-participant correlation: conditional on a
+person's intercept, the model assumes their residuals are uncorrelated, which is
+assumption A4 and the subject of §5.4.
+
+Here it runs 0.41 to 0.48 across models, so roughly **41-48% of the total variance is
+stable between-participant difference** rather than context-to-context fluctuation —
+equivalently, two boundaries set by the same participant are expected to correlate
+about 0.4. For `negative_boundary_pct`, for instance, the between-participant
+variance is 0.0161 against a residual variance of 0.0216, giving 0.0161 / (0.0161 +
+0.0216) = 0.43.
+
+That is large enough that the random intercept is doing real work rather than being
+a formality: a model without it would treat three answers from the same person as
+three independent observations and would badly understate the dependence in these
+data. Including it is not optional.
+
+### 5.4 Independence of residuals within a participant (A4)
+
+This is the assumption that, **conditional on** a participant's own intercept, their
+three context residuals are independent. Modelling all of a person's shared variance
+with a single number implies **compound symmetry**: the correlation between any two
+of that person's observations is the same, whichever two contexts you pick, and
+equals the ICC.
+
+::: {.callout-note}
+## Why this is not a lag-1 autocorrelation check
+
+Serial correlation is the usual worry in repeated-measures data and lag-1
+autocorrelation the usual diagnostic — but it needs a meaningful *ordering* within
+each unit, and there is not one here. The pre-registration randomised the order in
+which the three business contexts were presented, and the dataset records no
+display-order field; the per-context timing variables are page durations rather than
+timestamps, so the sequence cannot be reconstructed. Any "lag" computed on the
+restaurant / doctor / isp ordering used in this document would reflect how the rows
+were stacked, not anything about the data.
+
+With three observations per participant, the design-appropriate check is compound
+symmetry instead. Rather than asking whether *adjacent* residuals are correlated, it
+asks whether *all pairs* are correlated to the same degree — which is exactly what a
+single random intercept assumes.
+:::
+
+The check below takes marginal residuals (the outcome minus the fixed-effect
+prediction, so the participant effect is still present), reshapes them to one column
+per context, and correlates the three pairs. If A4 holds, those three correlations
+should be close to one another and close to the ICC the model implies.
+
+```{python}
+#| label: tbl-compound-symmetry
+#| tbl-cap: "Compound-symmetry check: pairwise correlations of marginal residuals between contexts, against the ICC each model implies."
+
+cs_pairs = [('doctor', 'isp'), ('doctor', 'restaurant'), ('isp', 'restaurant')]
+cs_rows = []
+for dv, lab in DV_DIAG_LABELS.items():
+    fit = diag_fit(dv, 'Bot-excluded sample')
+    s2e, s2u = fit.scale, float(fit.cov_re.iloc[0, 0])
+    icc = s2u / (s2u + s2e)
+    re_map = {k: float(v.iloc[0]) for k, v in fit.random_effects.items()}
+    d = samples['Bot-excluded sample'].copy()
+    d['marg'] = np.asarray(fit.resid) + d['response_id'].map(re_map)
+    W = d.pivot_table(index='response_id', columns='context', values='marg', observed=True).corr()
+    vals = [W.loc[a, b] for a, b in cs_pairs]
+    cs_rows.append({'DV': lab, 'ICC (model)': icc,
+                    'doctor-isp': vals[0], 'doctor-restaurant': vals[1],
+                    'isp-restaurant': vals[2],
+                    'mean r': np.mean(vals), 'spread': max(vals) - min(vals)})
+cs_table = pd.DataFrame(cs_rows).set_index('DV').round(3)
+cs_table
+```
+
+```{python}
+#| label: fig-compound-symmetry
+#| fig-cap: "Correlation of marginal residuals between each pair of contexts (bars) against the single correlation the random-intercept model implies for every pair (dashed line = ICC). Compound symmetry holds if the three bars are level with each other and with the line."
+#| fig-width: 6.8
+#| fig-height: 4.6
+
+fig, axes = plt.subplots(2, 2, figsize=(6.8, 4.6), sharey=True)
+for ax, (dv, lab) in zip(axes.flat, DV_DIAG_LABELS.items()):
+    row = cs_table.loc[lab]
+    names = ['doctor-isp', 'doctor-restaurant', 'isp-restaurant']
+    ax.bar(range(3), [row[n] for n in names], color='#4a7fb5', width=0.6)
+    ax.axhline(row['ICC (model)'], color='crimson', linestyle='--', linewidth=1.3)
+    ax.text(2.5, row['ICC (model)'] + 0.015, f"ICC {row['ICC (model)']:.2f}",
+            fontsize=7, color='crimson', va='bottom', ha='right')
+    ax.set_xticks(range(3))
+    ax.set_xticklabels(['doc-isp', 'doc-rest', 'isp-rest'], fontsize=7)
+    ax.set_ylim(0, 0.62)
+    ax.set_title(lab, fontsize=9)
+    ax.tick_params(axis='y', labelsize=8)
+for ax in axes[:, 0]:
+    ax.set_ylabel('correlation', fontsize=8)
+plt.tight_layout()
+plt.show()
+```
+
+**A4 is well supported.** For every DV the three bars sit close together and level
+with the dashed ICC line, and the mean of the three correlations lands almost
+exactly on the model-implied ICC — 0.410 against an ICC of 0.411 for
+`negative_boundary_pct`, 0.441 against 0.443 for `positive_boundary_pct`, 0.461
+against 0.463 for `neutral_width_pct`, and 0.402 against 0.404 for `asym`. The
+spread across the three pairs runs 0.03 to 0.11, well within sampling noise for
+correlations estimated on 748 participants.
+
+A single participant offset therefore does capture the shared structure in a
+person's three answers. There is no leftover context-pair-specific dependence — no
+sign, for instance, that a participant's doctor and ISP answers are related to each
+other in some way their restaurant answer is not.
+
+One caveat if you check this yourself: the same correlations computed on
+*conditional* residuals — after subtracting the participant effect — come out
+**negative**, around -0.21 to -0.38. That is a mechanical artefact, not a violation.
+With only three observations per person, estimating and removing that person's own
+mean forces the remaining deviations to offset one another. Using marginal residuals
+avoids that trap.
+
+### 5.5 Does any of it matter? Distribution-free standard errors
+
+Rather than argue about whether the violations above are "bad enough," this refits
+every model in a way that makes **no normality and no homoskedasticity assumption at
+all**: OLS with cluster-robust (sandwich) standard errors clustered on participant,
+which also allows arbitrary within-person correlation. If normality were doing real
+work, the standard errors would move.
+
+```{python}
+#| label: tbl-robust-se-check
+#| tbl-cap: "Model-based vs cluster-robust standard errors."
+
+_bs = samples['Bot-excluded sample']
+rob_rows = []
+for dv in dvs + ['asym']:
+    lmm = fit_mixedlm(f"{dv} ~ C(context) + C(condition)", _bs)
+    ols = smf.ols(f"{dv} ~ C(context) + C(condition)", data=_bs).fit(
+        cov_type='cluster', cov_kwds={'groups': _bs['response_id']})
+    for term in ['C(context)[T.isp]', f'C(condition)[T.{max(cond_labels)}]']:
+        rob_rows.append({
+            'DV': dv, 'term': term,
+            'b (LMM)': lmm.params[term], 'SE (LMM)': lmm.bse[term],
+            'b (robust)': ols.params[term], 'SE (robust)': ols.bse[term],
+            'SE ratio': ols.bse[term] / lmm.bse[term],
+            'p (LMM)': fmt_p(lmm.pvalues[term]), 'p (robust)': fmt_p(ols.pvalues[term]),
+        })
+pd.DataFrame(rob_rows).round(4)
+```
+
+The point estimates are identical (the design is near-balanced, so the mixed model
+and OLS agree on the fixed effects), and the robust standard errors are only
+**1-8% larger** than the model-based ones. Applying even the largest of those
+inflations leaves every significant term significant and every null term null. The
+normality assumption is contributing almost nothing to the inference — the
+conclusions in §6-§7 do not rest on it.
+
+### 5.6 Verdict
+
+Assumptions are **adequately met for the pre-registered linear mixed models**:
+
+- **A1 (homoskedasticity)** — met; no funnel in any panel.
+- **A2 (normal residuals)** — met for both boundary DVs; `neutral_width_pct` is
+  meaningfully right-skewed (≈ +1.3), the one real departure.
+- **A3 (normal random intercepts)** — met, with mild tail departure traceable to
+  participants at the scale's floor or ceiling.
+- **A4 (conditional independence)** — well supported; observed mean pairwise
+  correlations match the model-implied ICC to within 0.002.
+- **A5, A6** — satisfied by the design.
+
+The single caveat worth carrying forward is `neutral_width_pct`'s skew. The Wald
+tests are large-sample and robust to it at N ≈ 2,240, and §5.5 confirms the standard
+errors barely move — but if you want the belt-and-braces version, a **beta
+regression** (or ordered-beta, which tolerates exact 0s and 1s) is the natural refit
+for a bounded, skewed [0,1] outcome. That is exactly the discretion the
+pre-registration reserves ("should we observe violations of any critical statistical
+assumptions... the authors will use their discretion to determine the most
+appropriate models to re-fit"). It changes no conclusion reported here, so §6 onward
+proceeds with the pre-registered specification.
+
+## 6. H1-H3 results: boundary position and neutral-width models
+
+This section reports the omnibus tests of business context (H1), scale format (H2), and their interaction (H3) on the negative boundary, the positive boundary, and the neutral width.
+
+### 6.1 Formatted summary — H1-H3
+
+H1 and H2 come from the additive models; H3 comes from the saturated models (see
+§4.3).
+
+```{python}
+#| label: tbl-h1h3-pivot
+#| tbl-cap: "H1-H3 omnibus tests, by DV and sample."
+
+pivot = h1h3_summary.pivot_table(
+    index=['DV', 'term'], columns='sample', values=['chi2', 'df', 'p_fmt'], aggfunc='first'
+)
+pivot = pivot.reorder_levels([1, 0], axis=1).sort_index(axis=1, level=0)
+pivot
+```
+
+**H1 is significant for both boundary DVs** (`negative_boundary_pct`
+chi2(2) = 14.89 and `positive_boundary_pct` chi2(2) = 16.62, both p < .001) and
+clearly non-significant for `neutral_width_pct` (chi2(2) = 0.74, p = .690). **H2 is
+significant for the two boundaries** (chi2(3) = 19.36 and 23.59, both p < .001) but
+**not for neutral width** (chi2(3) = 4.62, p = .202). H3 is non-significant for all
+three.
+
+That middle result is the main way this analysis departs from the six-format one.
+With all six formats, H2 was strongly significant for `neutral_width_pct` as well;
+among the four *numeric* formats alone it is not. The neutral-width format effect was
+therefore carried by the two categorical scales, whose neutral bands were far wider
+(≈31% and ≈37% of the scale) than anything the numeric formats produce (≈23-26%).
+Within the numeric family, changing the number of scale points moves *where* the
+boundaries sit but not *how much room* people leave in the middle.
+
+### 6.2 Robustness check: F tests with Satterthwaite and Kenward-Roger df
+
+@tbl-h1h3-pivot reports Wald chi-squares because `MixedLM` is fit by REML and has no
+exact finite-sample reference distribution (§4.3). The chi-square is the limit of
+$\text{df}_1 \times F$ as the denominator degrees of freedom go to infinity, so the
+open question is whether using *finite* denominator df would change any conclusion.
+
+statsmodels implements neither approximation, so this section refits the same six
+models in R with `lmerTest` (Satterthwaite) and `pbkrtest` (Kenward-Roger) and puts
+the two sets of results side by side. The model specifications are identical:
+additive for H1 and H2, saturated for H3, random intercept for participant, REML.
+
+```{python}
+#| label: f-test-r
+
+import glob, os, shutil, subprocess, tempfile
+
+def find_rscript():
+    """Locate Rscript, falling back to a standard Windows install path."""
+    exe = shutil.which('Rscript')
+    if exe:
+        return exe
+    hits = []
+    for pat in (r'C:\Program Files\R\R-*\bin\Rscript.exe',
+                r'C:\Program Files\R\R-*\bin\x64\Rscript.exe',
+                '/usr/bin/Rscript', '/usr/local/bin/Rscript'):
+        hits += glob.glob(pat)
+    return sorted(hits)[-1] if hits else None
+
+R_CODE = r"""
+suppressPackageStartupMessages({library(lme4); library(lmerTest); library(pbkrtest)})
+args <- commandArgs(trailingOnly = TRUE)
+d <- read.csv(args[1]); lab <- args[2]
+d$context <- factor(d$context); d$condition <- factor(d$condition)
+d$response_id <- factor(d$response_id)
+
+grab <- function(tab, row, dv, term, ddf) data.frame(
+  DV = dv, term = term, sample = lab, ddf_method = ddf,
+  F_stat = as.numeric(tab[row, "F value"]), df1 = as.numeric(tab[row, "NumDF"]),
+  df2 = as.numeric(tab[row, "DenDF"]), p = as.numeric(tab[row, "Pr(>F)"]),
+  stringsAsFactors = FALSE)
+
+out <- list()
+for (dv in c("negative_boundary_pct", "positive_boundary_pct", "neutral_width_pct")) {
+  m_add <- lmer(as.formula(paste(dv, "~ context + condition + (1|response_id)")),
+                data = d, REML = TRUE)
+  m_sat <- lmer(as.formula(paste(dv, "~ context * condition + (1|response_id)")),
+                data = d, REML = TRUE)
+  for (ddf in c("Satterthwaite", "Kenward-Roger")) {
+    a <- anova(m_add, type = 3, ddf = ddf)
+    out[[length(out)+1]] <- grab(a, "context",   dv, "H1: context",      ddf)
+    out[[length(out)+1]] <- grab(a, "condition", dv, "H2: scale format", ddf)
+    b <- anova(m_sat, type = 3, ddf = ddf)
+    out[[length(out)+1]] <- grab(b, "context:condition", dv,
+                                 "H3: context x format", ddf)
+  }
+}
+write.csv(do.call(rbind, out), args[3], row.names = FALSE)
+"""
+
+RSCRIPT = find_rscript()
+f_results = None
+
+if RSCRIPT is None:
+    print("Rscript not found on this machine - skipping the F-test cross-check.")
+else:
+    tmp = tempfile.mkdtemp(prefix='sb_ftest_')
+    rfile = os.path.join(tmp, 'ftests.R')
+    with open(rfile, 'w', encoding='utf-8') as fh:
+        fh.write(R_CODE)
+
+    keep = ['response_id', 'context', 'condition'] + dvs
+    frames = []
+    for label, tag in (('Full sample', 'full'), ('Bot-excluded sample', 'excl')):
+        din = os.path.join(tmp, f'd_{tag}.csv')
+        dout = os.path.join(tmp, f'f_{tag}.csv')
+        samples[label][keep].to_csv(din, index=False)
+        proc = subprocess.run([RSCRIPT, rfile, din, label, dout],
+                              capture_output=True, text=True)
+        if proc.returncode != 0 or not os.path.exists(dout):
+            print(f"R call failed for {label} (exit {proc.returncode}):")
+            print(proc.stderr[-1200:])
+            frames = None
+            break
+        frames.append(pd.read_csv(dout))
+
+    if frames:
+        f_results = pd.concat(frames, ignore_index=True)
+        print(f"Refit in R via {os.path.basename(RSCRIPT)}: "
+              f"{len(f_results)} F tests across 2 samples x 2 ddf methods.")
+```
+
+```{python}
+#| label: tbl-f-vs-chi2
+#| tbl-cap: "H1-H3: Wald chi-square against F tests with Satterthwaite and Kenward-Roger denominator degrees of freedom. p-values below .001 are shown in scientific notation so the three methods can actually be compared."
+
+def fmt_p_sci(v):
+    """Like fmt_p, but keeps resolution below .001 so methods can be compared."""
+    return f'{v:.2e}' if v < .001 else f'{v:.3f}'
+
+if f_results is None:
+    print("R not available - no comparison to show.")
+else:
+    key = ['DV', 'term', 'sample']
+    satt = f_results[f_results['ddf_method'] == 'Satterthwaite'].set_index(key)
+    kr = f_results[f_results['ddf_method'] == 'Kenward-Roger'].set_index(key)
+    base = h1h3_summary.set_index(key)
+
+    fcomp = pd.DataFrame({
+        'chi2': base['chi2'],
+        'df': base['df'].astype(int),
+        'p (chi2)': base['p'].apply(fmt_p_sci),
+        'F': satt['F_stat'].round(3),
+        'df1': satt['df1'].astype(int),
+        'df2 Satt': satt['df2'].round(1),
+        'p (Satt)': satt['p'].apply(fmt_p_sci),
+        'df2 KR': kr['df2'].round(1),
+        'p (KR)': kr['p'].apply(fmt_p_sci),
+    }).sort_index()
+    # nested in `else:`, so auto-display won't fire - show it explicitly
+    display(fcomp)
+```
+
+```{python}
+#| label: f-test-agreement
+
+if f_results is not None:
+    key = ['DV', 'term', 'sample']
+    _b = h1h3_summary.set_index(key)
+    # R returns the rows in its own order, so align on the chi-square table's index
+    _s = f_results[f_results['ddf_method'] == 'Satterthwaite'].set_index(key).reindex(_b.index)
+    _k = f_results[f_results['ddf_method'] == 'Kenward-Roger'].set_index(key).reindex(_b.index)
+    assert _s['F_stat'].notna().all() and _k['F_stat'].notna().all(), "unmatched terms"
+
+    # chi2 should equal df1 * F exactly; the p-values are what can drift
+    recon = (_s['df1'] * _s['F_stat'])
+    max_stat_gap = float((recon - _b['chi2']).abs().max())
+    max_p_gap_satt = float((_s['p'] - _b['p']).abs().max())
+    max_p_gap_kr = float((_k['p'] - _b['p']).abs().max())
+    satt_vs_kr = float((_s['p'] - _k['p']).abs().max())
+    flips = int(((_b['p'] < .05) != (_s['p'] < .05)).sum()
+                + ((_b['p'] < .05) != (_k['p'] < .05)).sum())
+
+    print(f"max |df1*F - chi2|            : {max_stat_gap:.4f}")
+    print(f"max |p_Satterthwaite - p_chi2|: {max_p_gap_satt:.2e}")
+    print(f"max |p_KenwardRoger  - p_chi2|: {max_p_gap_kr:.2e}")
+    print(f"max |p_Satt - p_KR|           : {satt_vs_kr:.2e}")
+    print(f"significance decisions changed at alpha=.05: {flips} of {2*len(_b)}")
+```
+
+**The results are robust.** Three things to read off @tbl-f-vs-chi2:
+
+- **The test statistics are the same object.** In every row $\chi^2 = \text{df}_1
+  \times F$ to within rounding, which is exactly what the asymptotic relationship
+  predicts. Nothing about the *estimates* changes between the two approaches; only
+  the reference distribution does.
+- **Satterthwaite and Kenward-Roger agree to the displayed precision.** That is the
+  expected result for a random-intercept model on a balanced design: Kenward-Roger's
+  extra contribution is a small-sample correction to the covariance of the fixed
+  effects, and with 748 participants and a single variance component there is
+  essentially nothing for it to correct.
+- **No hypothesis changes its verdict.** The denominator df land at 744-799 for H2
+  and roughly 1,490-1,610 for H1 and H3 — smaller than in the six-format analysis
+  because both the sample and the number of formats shrank, but still far enough into
+  the tail that the *F* and chi-square p-values agree to about three significant
+  figures. Every significant result stays significant and every null result stays
+  null, in both samples.
+
+The denominator df themselves are worth a glance, because they show the design
+rather than an approximation artefact. Scale format is **between** participants, so
+H2 is referred to roughly (participants - 6) df. Context is **within** participants,
+so H1 and H3 are referred to the much larger within-participant residual df. That
+split is what a classical split-plot analysis of this design would give, and
+Satterthwaite recovers it without being told.
+
+### 6.3 Which business contexts differ? (H1)
+
+@tbl-h1h3-pivot says context matters for both boundaries and not for neutral width.
+This says *which* contexts. Cell entries are **EMM (SE)** with Tukey letter
+groupings assigned within each column (§4.5).
+
+```{python}
+#| label: tbl-emm-table-context
+#| tbl-cap: "Estimated marginal means by business context for the H1-H3 DVs, with Tukey letter groupings."
+
+ctx_tbl = pd.DataFrame({
+    DV_LABELS[dv]: emm_data[(dv, 'context')].set_index('level')['display']
+    for dv in H13_DVS
+}).reindex(CTX_LEVELS)
+ctx_tbl.index.name = 'Context'
+ctx_tbl
+```
+
+```{python}
+#| label: fig-emm-context
+#| fig-cap: "Estimated marginal means (±95% CI) by business context for the three H1-H3 DVs, with Tukey letter groupings. Levels sharing a letter are not significantly different."
+#| fig-width: 6.8
+#| fig-height: 2.9
+
+fig, axes = plt.subplots(1, 3, figsize=(6.8, 2.9))
+for ax, dv in zip(axes, H13_DVS):
+    emm_panel(ax, dv, 'context', CTX_LEVELS, rot=15, lab_fs=8)
+axes[0].set_ylabel('Est. marginal mean', fontsize=8)
+plt.tight_layout()
+plt.show()
+```
+
+Doctor separates from isp and restaurant on both boundaries, and isp and restaurant
+are statistically indistinguishable from each other. So the significant H1 result
+for the boundaries is carried by the doctor context sitting apart from the other
+two, not by a graded three-way ordering — exactly the pattern the six-format
+analysis found. On neutral width all three contexts share a single letter, the
+non-significant H1 result for that DV seen at the level of individual comparisons.
+
+### 6.4 Which scale formats differ? (H2)
+
+The same comparisons across the six formats, which is the H2 effect resolved into
+individual pairs.
+
+```{python}
+#| label: tbl-emm-table-condition
+#| tbl-cap: "Estimated marginal means by scale format for the H1-H3 DVs, with Tukey letter groupings."
+
+cond_tbl = pd.DataFrame({
+    DV_LABELS[dv]: emm_data[(dv, 'condition')].set_index('level')['display']
+    for dv in H13_DVS
+}).reindex(cond_order)
+cond_tbl.index.name = 'Scale format'
+cond_tbl
+```
+
+```{python}
+#| label: fig-emm-condition
+#| fig-cap: "Estimated marginal means (±95% CI) by scale format for the three H1-H3 DVs, with Tukey letter groupings. Levels sharing a letter are not significantly different."
+#| fig-width: 6.8
+#| fig-height: 3.6
+
+fig, axes = plt.subplots(1, 3, figsize=(6.8, 3.6))
+for ax, dv in zip(axes, H13_DVS):
+    emm_panel(ax, dv, 'condition', cond_order, rot=45, lab_fs=6.5)
+axes[0].set_ylabel('Est. marginal mean', fontsize=8)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+#| label: fig-emm-pmatrix
+#| fig-cap: "Tukey-adjusted pairwise p-values between scale formats (lower triangle) for the three H1-H3 DVs. Darker cells are smaller p-values; the colour scale saturates at .20."
+#| fig-width: 6.8
+#| fig-height: 6.2
+
+fig, axes = plt.subplots(2, 2, figsize=(6.8, 6.2))
+for ax, dv in zip(axes.flat, H13_DVS):
+    pmat_panel(ax, dv)
+axes.flat[3].axis('off')
+plt.tight_layout()
+plt.show()
+```
+
+Among the numeric formats the H2 effect is a **coarseness** effect rather than a
+clean ordering by number of points. For the negative boundary, 0-100 (0.476) and 1-5
+(0.469) sit highest and 1-6 (0.420) lowest, with 1-10 (0.429) in between; 1-5 and
+0-100 share a letter despite being the coarsest and the finest scales in the set. The
+positive boundary separates only 1-6 (0.656) from the other three.
+
+The neutral-width column is the one to notice: **all four formats share a single
+letter**, spanning just 0.229 to 0.264. That is the non-significant H2 result for
+`neutral_width_pct`, and it is what distinguishes this analysis from the six-format
+one, where the categorical scales pulled that column apart. §7.4 draws the same
+point geometrically.
+
+## 7. H4-H6 results: zone-asymmetry models
+
+This section reports the tests of whether the negative and positive zones differ in size (H4), and whether that asymmetry varies across business contexts (H5) or scale formats (H6).
+
+### 7.1 Formatted summary — H4-H6
+
+All three tests come from the paired asymmetry score defined in §4.2: H4 from the
+intercept-only model, H5 and H6 from the covariate model (§4.4).
+
+```{python}
+#| label: tbl-h456-pivot
+#| tbl-cap: "H4-H6 omnibus tests, by sample."
+
+pivot2 = h456_summary.pivot_table(
+    index='term', columns='sample', values=['chi2', 'df', 'p_fmt'], aggfunc='first'
+)
+pivot2 = pivot2.reorder_levels([1, 0], axis=1).sort_index(axis=1, level=0)
+pivot2
+```
+
+### 7.2 Fixed-effect coefficients (bot-excluded sample)
+
+Coefficients of the H5/H6 covariate model. Reference levels: context = doctor,
+condition = 1 (1-5 scale) — so this model's intercept is the asymmetry *at that
+reference cell* (≈-0.20) and is **not** the H4 test. H4's average-asymmetry
+estimate (≈-0.085) comes from the separate intercept-only model reported in §4.4.
+Recall `asym` is signed positive-minus-negative, so a *positive* coefficient here
+means that level has a **less** negative-dominated split than the reference.
+
+```{python}
+#| label: h456-coefs
+
+fit = h456_results['Bot-excluded sample']
+print(f"asym ~ context + condition  (bot-excluded sample, N={int(fit.nobs)})")
+print(fit.summary().tables[1])
+```
+
+The asymmetry means themselves are plotted in §7.3, as estimated marginal means
+with 95% CIs and Tukey letter groupings.
+
+### 7.3 Which contexts and formats differ in asymmetry? (H5, H6)
+
+The same estimated marginal means and Tukey comparisons as §6.3 and §6.4, applied to
+the signed asymmetry score. Letters are assigned within each factor separately, so
+the context block and the scale-format block use independent alphabets.
+
+```{python}
+#| label: tbl-emm-table-asym
+#| tbl-cap: "Estimated marginal means for the asymmetry score, by business context and by scale format, with Tukey letter groupings assigned within each factor."
+
+asym_rows = []
+for _factor, _order, _lab in (('context', CTX_LEVELS, 'Business context'),
+                              ('condition', cond_order, 'Scale format')):
+    _e = emm_data[('asym', _factor)].set_index('level').reindex(_order)
+    for _lev, _r in _e.iterrows():
+        asym_rows.append({'Factor': _lab, 'Level': _lev,
+                          'Asymmetry (pos - neg)': _r['display']})
+asym_emm_tbl = pd.DataFrame(asym_rows).set_index(['Factor', 'Level'])
+asym_emm_tbl
+```
+
+```{python}
+#| label: fig-emm-asym
+#| fig-cap: "Estimated marginal means (±95% CI) for the asymmetry score by business context (H5) and by scale format (H6), with Tukey letter groupings. The dashed line is zero — equal negative and positive zones."
+#| fig-width: 6.8
+#| fig-height: 3.6
+
+fig, axes = plt.subplots(1, 2, figsize=(6.8, 3.6))
+emm_panel(axes[0], 'asym', 'context', CTX_LEVELS, rot=15, lab_fs=8)
+axes[0].set_title('By business context (H5)', fontsize=9)
+emm_panel(axes[1], 'asym', 'condition', cond_order, rot=45, lab_fs=6.5)
+axes[1].set_title('By scale format (H6)', fontsize=9)
+axes[0].set_ylabel('Est. marginal mean (pos - neg)', fontsize=8)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+#| label: fig-emm-pmatrix-asym
+#| fig-cap: "Tukey-adjusted pairwise p-values between scale formats on the asymmetry score (lower triangle)."
+#| fig-width: 4.6
+#| fig-height: 3.9
+
+fig, ax = plt.subplots(figsize=(4.6, 3.9))
+pmat_panel(ax, 'asym', annot_fs=6.5)
+plt.tight_layout()
+plt.show()
+```
+
+On context, doctor is the most negative-dominated context, again distinct from isp
+and restaurant, which do not differ from each other — the same doctor-versus-the-rest
+pattern as the raw boundaries in §6.3, but larger: the negative zone shrinks while
+the positive zone grows, so the two small boundary shifts compound in the gap
+between them instead of cancelling.
+
+On format, **every numeric format is negative-dominated** — all four asymmetry means
+are below zero, from 1-6 at -0.076 up to 0-100 at -0.192. (The one format that
+reversed this in the six-format analysis, Poor to Excellent, is a categorical scale
+and is not in this document.) The spread across formats is still reliable: 0-100 and
+1-6 sit at opposite ends and share no letter, with 1-5 and 1-10 in between.
+
+Watch the ranking direction here. Letters are assigned in descending order of the
+marginal mean, and because `asym` is signed positive-minus-negative, letter `a`
+marks the **least** negative-dominated level — the opposite of the ranking direction
+in the boundary columns of §6.3 and §6.4.
+
+::: {.callout-note collapse="true"}
+## All pairwise contrasts behind the letter displays
+
+Every contrast underlying the letters in §6.3, §6.4, and §7.3, for all four DVs and
+both factors.
+
+```{python}
+#| label: tbl-emm-pairs-full
+#| tbl-cap: "All pairwise contrasts with Tukey-adjusted p-values."
+
+pairs_all = []
+for (dv, factor), p in pair_data.items():
+    t = p.copy()
+    t.insert(0, 'DV', DV_LABELS[dv])
+    t.insert(1, 'factor', 'context' if factor == 'context' else 'scale format')
+    pairs_all.append(t)
+pairs_all = pd.concat(pairs_all, ignore_index=True)
+pairs_all['p_tukey_fmt'] = pairs_all['p_tukey'].apply(fmt_p)
+pairs_all['sig'] = np.where(pairs_all['p_tukey'] < 0.05, '*', '')
+
+# 72 rows total, so lift pandas' 60-row display cap or the table gets truncated
+with pd.option_context('display.max_rows', 200):
+    display(pairs_all[['DV', 'factor', 'a', 'b', 'diff', 'se', 'z',
+                       'p_tukey_fmt', 'sig']].round(4))
+```
+
+:::
+
+### 7.4 Scale anatomy: where the zones fall on each scale
+
+§7.1-§7.3 give the asymmetry as a number; this shows it as a picture, and puts the
+two boundaries back on the scale they came from. Every rating scale is drawn as a
+line, split into the three regions the
+average participant carves out: the **negative** region running from the scale's
+floor up to the mean negative boundary, the **neutral** region between the two
+boundaries, and the **positive** region from the mean positive boundary to the
+scale's ceiling. The `^` marker under each line is the neutral-zone midpoint.
+
+Boundary positions are the estimated marginal means computed in §4.5 — the same
+ones tabulated by format in §6.4 — averaged across the three business contexts, so
+a single line summarises all contexts for that format.
+
+```{python}
+#| label: tbl-scale-geometry
+#| tbl-cap: "Boundary positions and zone widths for each scale format."
+
+SCALE_GEOM = {
+    '1-5':   dict(lo=1.0, hi=5.0,   ticks=[1, 2, 3, 4, 5], labels=None),
+    '1-6':   dict(lo=1.0, hi=6.0,   ticks=[1, 2, 3, 4, 5, 6], labels=None),
+    '1-10':  dict(lo=1.0, hi=10.0,  ticks=list(range(1, 11)), labels=None),
+    '0-100': dict(lo=0.0, hi=100.0, ticks=[0, 20, 40, 60, 80, 100], labels=None),
+}
+C_NEG, C_NEU, C_POS = '#d6604d', '#e0e0e0', '#4a9d5f'
+
+def to_native(fmt, pct):
+    g = SCALE_GEOM[fmt]
+    return g['lo'] + pct * (g['hi'] - g['lo'])
+
+_neg_e = emm_data[('negative_boundary_pct', 'condition')].set_index('level')
+_pos_e = emm_data[('positive_boundary_pct', 'condition')].set_index('level')
+NEG_EMM, POS_EMM = _neg_e['emm'].to_dict(), _pos_e['emm'].to_dict()
+NEG_SE, POS_SE = _neg_e['se'].to_dict(), _pos_e['se'].to_dict()
+
+def half_ci(se):
+    """Half-width of a 95% CI on the rescaled 0-1 metric."""
+    return 1.96 * se
+
+zone_geom_tbl = pd.DataFrame([
+    {
+        'Scale format': fmt,
+        'neg boundary (native)': round(to_native(fmt, NEG_EMM[fmt]), 2),
+        'pos boundary (native)': round(to_native(fmt, POS_EMM[fmt]), 2),
+        'midpoint (native)': round(to_native(fmt, (NEG_EMM[fmt] + POS_EMM[fmt]) / 2), 2),
+        'negative zone %': round(NEG_EMM[fmt] * 100, 1),
+        'neutral zone %': round((POS_EMM[fmt] - NEG_EMM[fmt]) * 100, 1),
+        'positive zone %': round((1 - POS_EMM[fmt]) * 100, 1),
+    }
+    for fmt in cond_order
+]).set_index('Scale format')
+zone_geom_tbl
+```
+
+```{python}
+#| label: fig-scale-anatomy-rescaled
+#| fig-cap: "Each scale as a line on the common rescaled 0-1 metric, split into the average negative / neutral / positive regions. Percentages are each region's share of the scale; bold numbers are the boundary positions in that scale's own units; the caret marks the neutral midpoint. Black whiskers are 95% CIs on each boundary, and the dotted vertical line is the objective 50% point of the scale."
+#| fig-width: 6.8
+#| fig-height: 4.8
+
+from matplotlib.patches import Patch
+from matplotlib.lines import Line2D
+
+fig, ax = plt.subplots(figsize=(6.8, 4.8))
+h = 0.52
+for i, fmt in enumerate(cond_order):
+    y = len(cond_order) - 1 - i
+    n, p = NEG_EMM[fmt], POS_EMM[fmt]
+    ax.barh(y, n,     left=0, height=h, color=C_NEG, edgecolor='white')
+    ax.barh(y, p - n, left=n, height=h, color=C_NEU, edgecolor='white')
+    ax.barh(y, 1 - p, left=p, height=h, color=C_POS, edgecolor='white')
+    mid = (n + p) / 2
+    # point estimates with 95% CI whiskers
+    ax.errorbar([n, p], [y, y],
+                xerr=[half_ci(NEG_SE[fmt]), half_ci(POS_SE[fmt])],
+                fmt='o', color='black', markersize=3.5,
+                elinewidth=1.4, capsize=3, capthick=1.4, zorder=5)
+    ax.plot([mid], [y - h / 2 - 0.10], marker='^', color='#333', markersize=7)
+    ax.text(n / 2, y, f'{n*100:.0f}%', ha='center', va='center', fontsize=8, color='white')
+    ax.text((1 + p) / 2, y, f'{(1-p)*100:.0f}%', ha='center', va='center', fontsize=8, color='white')
+    if p - n > 0.10:
+        ax.text(mid, y + 0.13, f'{(p-n)*100:.0f}%', ha='center', va='center', fontsize=8, color='#333')
+    ax.text(n, y + h / 2 + 0.06, f'{to_native(fmt, n):.2f}', ha='center', va='bottom',
+            fontsize=7.5, fontweight='bold')
+    ax.text(p, y + h / 2 + 0.06, f'{to_native(fmt, p):.2f}', ha='center', va='bottom',
+            fontsize=7.5, fontweight='bold')
+
+# objective 50% of the scale
+ax.axvline(0.5, color='#222', linestyle=':', linewidth=1.5, zorder=6)
+
+ax.set_yticks(range(len(cond_order)))
+ax.set_yticklabels(list(reversed(cond_order)))
+ax.set_xlim(-0.01, 1.01)
+ax.set_ylim(-0.75, len(cond_order) - 0.25)
+ax.set_xlabel('Position along the scale (rescaled 0-1)')
+ax.set_axisbelow(True)
+ax.xaxis.grid(True, alpha=0.3)
+ax.yaxis.grid(False)
+ax.legend(handles=[Patch(facecolor=C_NEG, label='"Negative" region'),
+                   Patch(facecolor=C_NEU, label='"Neutral" region'),
+                   Patch(facecolor=C_POS, label='"Positive" region'),
+                   Line2D([0], [0], color='#222', linestyle=':', linewidth=1.5,
+                          label='Objective 50% of scale'),
+                   Line2D([0], [0], color='black', linewidth=1.4, marker='o', markersize=3.5,
+                          label='Boundary estimate ± 95% CI')],
+          loc='lower center', bbox_to_anchor=(0.5, -0.40), ncol=3, frameon=False, fontsize=8)
+plt.tight_layout()
+plt.show()
+```
+
+Figures 19 and 20 average over business context, so each format is a single line.
+The two figures that follow break the same picture out **by context**. Because every
+participant answered all three contexts within one format, these are observed cell
+means rather than pooled model estimates — in this balanced design the two coincide,
+but the split version can show context-by-format variation that the additive models
+in §4.3 deliberately pool away.
+
+```{python}
+#| label: anatomy-cells
+
+_ac = samples['Bot-excluded sample'].copy()
+_ac['fmt'] = _ac['condition'].map(cond_labels)
+
+cell_stats = (_ac.groupby(['fmt', 'context'], observed=True)
+                 .agg(neg=('negative_boundary_pct', 'mean'),
+                      neg_sd=('negative_boundary_pct', 'std'),
+                      pos=('positive_boundary_pct', 'mean'),
+                      pos_sd=('positive_boundary_pct', 'std'),
+                      n=('negative_boundary_pct', 'size')))
+cell_stats['neg_se'] = cell_stats['neg_sd'] / np.sqrt(cell_stats['n'])
+cell_stats['pos_se'] = cell_stats['pos_sd'] / np.sqrt(cell_stats['n'])
+
+CELL = cell_stats.to_dict('index')
+print(f"{len(CELL)} format x context cells, "
+      f"{cell_stats['n'].min()}-{cell_stats['n'].max()} participants each "
+      f"(bot-excluded sample).")
+```
+
+```{python}
+#| label: fig-scale-anatomy-by-context
+#| fig-cap: "The rescaled 0-1 anatomy of @fig-scale-anatomy-rescaled, split by business context. One panel per context; percentages are each region's share of the scale; black whiskers are 95% CIs on each boundary; the dotted line is the objective 50% point. Bot-excluded sample."
+#| fig-width: 6.8
+#| fig-height: 7.8
+
+fig, axes = plt.subplots(3, 1, figsize=(6.8, 7.8), sharex=True)
+_hh = 0.56
+for ax, ctx in zip(axes, CTX_LEVELS):
+    for i, fmt in enumerate(cond_order):
+        y = len(cond_order) - 1 - i
+        c = CELL[(fmt, ctx)]
+        n, pz = c['neg'], c['pos']
+        ax.barh(y, n,      left=0, height=_hh, color=C_NEG, edgecolor='white')
+        ax.barh(y, pz - n, left=n, height=_hh, color=C_NEU, edgecolor='white')
+        ax.barh(y, 1 - pz, left=pz, height=_hh, color=C_POS, edgecolor='white')
+        ax.errorbar([n, pz], [y, y],
+                    xerr=[1.96 * c['neg_se'], 1.96 * c['pos_se']],
+                    fmt='o', color='black', markersize=3, elinewidth=1.2,
+                    capsize=2.5, capthick=1.2, zorder=5)
+        ax.text(n / 2, y, f'{n*100:.0f}%', ha='center', va='center',
+                fontsize=7, color='white')
+        ax.text((1 + pz) / 2, y, f'{(1-pz)*100:.0f}%', ha='center', va='center',
+                fontsize=7, color='white')
+        ax.text((n + pz) / 2, y, f'{(pz-n)*100:.0f}%', ha='center', va='center',
+                fontsize=7, color='#333')
+    ax.axvline(0.5, color='#222', linestyle=':', linewidth=1.3, zorder=6)
+    ax.set_yticks(range(len(cond_order)))
+    ax.set_yticklabels(list(reversed(cond_order)), fontsize=7.5)
+    ax.set_xlim(-0.01, 1.01)
+    ax.set_ylim(-0.6, len(cond_order) - 0.4)
+    ax.set_title(ctx, fontsize=9.5, fontweight='bold')
+    ax.set_axisbelow(True)
+    ax.xaxis.grid(True, alpha=0.3)
+    ax.yaxis.grid(False)
+
+axes[-1].set_xlabel('Position along the scale (rescaled 0-1)', fontsize=8.5)
+axes[-1].legend(handles=[Patch(facecolor=C_NEG, label='"Negative" region'),
+                         Patch(facecolor=C_NEU, label='"Neutral" region'),
+                         Patch(facecolor=C_POS, label='"Positive" region'),
+                         Line2D([0], [0], color='#222', linestyle=':', linewidth=1.3,
+                                label='Objective 50% of scale'),
+                         Line2D([0], [0], color='black', linewidth=1.2, marker='o',
+                                markersize=3, label='Boundary ± 95% CI')],
+                loc='upper center', bbox_to_anchor=(0.5, -0.28), ncol=3,
+                frameon=False, fontsize=7.5)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+#| label: fig-scale-anatomy-native
+#| fig-cap: "The same regions drawn on each scale's own native units and tick labels, so the cutoffs can be read directly off the response options participants actually saw. Whiskers are 95% CIs; the dotted vertical line in each panel is that scale's objective 50% point."
+#| fig-width: 6.8
+#| fig-height: 8.0
+
+fig, axes = plt.subplots(len(cond_order), 1, figsize=(6.8, 8.0))
+for ax, fmt in zip(axes, cond_order):
+    g = SCALE_GEOM[fmt]
+    lo, hi = g['lo'], g['hi']
+    span = hi - lo
+    n, p = to_native(fmt, NEG_EMM[fmt]), to_native(fmt, POS_EMM[fmt])
+    mid = (n + p) / 2
+    ax.barh(0, n - lo, left=lo, height=0.45, color=C_NEG, edgecolor='white')
+    ax.barh(0, p - n,  left=n,  height=0.45, color=C_NEU, edgecolor='white')
+    ax.barh(0, hi - p, left=p,  height=0.45, color=C_POS, edgecolor='white')
+    # point estimates with 95% CI whiskers (CI scaled into native units)
+    ax.errorbar([n, p], [0, 0],
+                xerr=[half_ci(NEG_SE[fmt]) * span, half_ci(POS_SE[fmt]) * span],
+                fmt='o', color='black', markersize=3.5,
+                elinewidth=1.4, capsize=3, capthick=1.4, zorder=5)
+    for xv in (n, p):
+        ax.text(xv, 0.30, f'{xv:.2f}', ha='center', va='bottom', fontsize=8, fontweight='bold')
+    ax.plot([mid], [0], marker='^', color='#333', markersize=7)
+    ax.text(mid, -0.34, f'mid {mid:.2f}', ha='center', va='top', fontsize=7.5, color='#555')
+    # objective 50% of this scale's own range
+    ax.axvline(lo + span / 2, color='#222', linestyle=':', linewidth=1.5, zorder=6)
+    ax.set_xlim(lo - span * 0.02, hi + span * 0.02)
+    ax.set_ylim(-0.66, 0.66)
+    ax.set_yticks([])
+    ax.set_xticks(g['ticks'])
+    ax.set_xticklabels(g['labels'] if g['labels'] else [str(t) for t in g['ticks']], fontsize=7.5)
+    ax.set_ylabel(fmt, rotation=0, ha='right', va='center', fontsize=9, labelpad=12)
+    for s in ('top', 'right', 'left'):
+        ax.spines[s].set_visible(False)
+
+fig.legend(handles=[Line2D([0], [0], color='#222', linestyle=':', linewidth=1.5,
+                           label='Objective 50% of scale'),
+                    Line2D([0], [0], color='black', linewidth=1.4, marker='o', markersize=3.5,
+                           label='Boundary estimate ± 95% CI'),
+                    Line2D([0], [0], color='#333', linestyle='none', marker='^', markersize=7,
+                           label='Neutral-zone midpoint')],
+           loc='lower center', ncol=3, frameon=False, fontsize=8, bbox_to_anchor=(0.5, -0.015))
+plt.tight_layout(rect=[0, 0.028, 1, 1])
+plt.show()
+```
+
+```{python}
+#| label: fig-scale-anatomy-native-by-context
+#| fig-cap: "The native-units anatomy of @fig-scale-anatomy-native, split by business context. One panel per scale format, with the three contexts stacked inside it, so the cutoffs can be compared against the response options participants actually saw. Whiskers are 95% CIs; the dotted line is that scale's objective 50% point. Bot-excluded sample."
+#| fig-width: 6.8
+#| fig-height: 9.2
+
+fig, axes = plt.subplots(len(cond_order), 1, figsize=(6.8, 9.2))
+for ax, fmt in zip(axes, cond_order):
+    g = SCALE_GEOM[fmt]
+    lo, hi = g['lo'], g['hi']
+    span = hi - lo
+    for j, ctx in enumerate(CTX_LEVELS):
+        y = len(CTX_LEVELS) - 1 - j
+        c = CELL[(fmt, ctx)]
+        n = to_native(fmt, c['neg'])
+        pz = to_native(fmt, c['pos'])
+        ax.barh(y, n - lo,  left=lo, height=0.62, color=C_NEG, edgecolor='white')
+        ax.barh(y, pz - n,  left=n,  height=0.62, color=C_NEU, edgecolor='white')
+        ax.barh(y, hi - pz, left=pz, height=0.62, color=C_POS, edgecolor='white')
+        ax.errorbar([n, pz], [y, y],
+                    xerr=[1.96 * c['neg_se'] * span, 1.96 * c['pos_se'] * span],
+                    fmt='o', color='black', markersize=3, elinewidth=1.2,
+                    capsize=2.5, capthick=1.2, zorder=5)
+        ax.text(n, y + 0.36, f'{n:.2f}', ha='center', va='bottom',
+                fontsize=6.5, fontweight='bold')
+        ax.text(pz, y + 0.36, f'{pz:.2f}', ha='center', va='bottom',
+                fontsize=6.5, fontweight='bold')
+    ax.axvline(lo + span / 2, color='#222', linestyle=':', linewidth=1.3, zorder=6)
+    ax.set_xlim(lo - span * 0.02, hi + span * 0.02)
+    ax.set_ylim(-0.6, len(CTX_LEVELS) - 0.25)
+    ax.set_yticks(range(len(CTX_LEVELS)))
+    ax.set_yticklabels(list(reversed(CTX_LEVELS)), fontsize=7)
+    ax.set_xticks(g['ticks'])
+    ax.set_xticklabels(g['labels'] if g['labels'] else [str(t) for t in g['ticks']],
+                       fontsize=7)
+    ax.set_ylabel(fmt, rotation=0, ha='right', va='center', fontsize=8.5, labelpad=10)
+    for sp in ('top', 'right', 'left'):
+        ax.spines[sp].set_visible(False)
+
+fig.legend(handles=[Patch(facecolor=C_NEG, label='"Negative"'),
+                    Patch(facecolor=C_NEU, label='"Neutral"'),
+                    Patch(facecolor=C_POS, label='"Positive"'),
+                    Line2D([0], [0], color='#222', linestyle=':', linewidth=1.3,
+                           label='Objective 50% of scale'),
+                    Line2D([0], [0], color='black', linewidth=1.2, marker='o',
+                           markersize=3, label='Boundary ± 95% CI')],
+           loc='lower center', ncol=5, frameon=False, fontsize=7.5,
+           bbox_to_anchor=(0.5, -0.012))
+plt.tight_layout(rect=[0, 0.025, 1, 1])
+plt.show()
+```
+
+Splitting by context mostly **confirms that format is the dominant story and context
+is a second-order adjustment**. The ordering of the six formats is the same in all
+three panels: 0-100 and 1-5 always have the largest negative region and 1-6 the
+smallest. Nothing about the §6.4 format ranking is an artefact of pooling contexts.
+
+Within a format, the contexts move by about 0.02 to 0.05 on the rescaled metric —
+visible and consistently in the H1 direction (doctor's negative boundary sits highest
+in three of the four formats) — which here is comparable to, not dwarfed by, the
+format spread of about 0.06 between 1-6 and 0-100. The neutral band is the most stable element of all: within
+any given format it varies by at most about 2 percentage points across the three
+contexts, which is the null H1 result for `neutral_width_pct` seen geometrically.
+
+A few things this makes visible that the tables don't:
+
+- **The negative region is the biggest one on every format.** On 0-100 it runs from
+  0 all the way to ~47.6 — nearly half the scale is "negative" — with only ~28% left
+  for "positive." That is the H4 asymmetry, drawn to scale, and it holds on all four
+  numeric formats (negative regions 42.0-47.6%, positive regions 28.4-34.4%).
+- **In native units the cutoffs are strikingly consistent.** The negative boundary
+  falls at 2.88 on 1-5, 3.10 on 1-6, 4.86 on 1-10 and 47.56 on 0-100 — all close to
+  the same *relative* position — and the positive boundary at 3.79, 4.28, 7.24 and
+  71.60. On a 1-5 scale a "3" is already inside the negative region, and a rating
+  needs to clear about 3.8 before it reads as positive.
+- **The neutral bands are nearly identical across formats** (22.9-26.4%), which is
+  the *non-significant* H2 neutral-width result from §6 shown geometrically. With the
+  categorical scales removed there is no format here that carves out a conspicuously
+  wide middle.
+- **The objective 50% mark lands inside the neutral band on every format** — so the
+  scale's true centre is never itself "negative" or "positive." But it sits in the
+  *lower* part of that band on five of six formats, because the neutral midpoint is
+  above 0.5 on all four numeric formats. In other words the neutral zone is
+  consistently shifted *up* relative to the scale's true centre: the midpoint people
+  behave as if is the middle is a bit more generous than the actual middle.
+- **The CI whiskers are narrow** (roughly ±0.02 on the rescaled metric, ±2 points on
+  0-100), so the format-to-format differences in the figure are large relative to
+  the uncertainty in each estimate — consistent with the strong H2 result.
+
+## 8. All six hypotheses at a glance
+
+This section collects the omnibus test for every hypothesis into a single table, reported for both the full and the bot-excluded sample.
+
+```{python}
+#| label: tbl-master-summary
+#| tbl-cap: "All six hypotheses: omnibus test results."
+
+master_rows = []
+for _, r in h1h3_summary.iterrows():
+    if r['term'].startswith('H'):
+        master_rows.append({'hypothesis': r['term'], 'model': r['DV'], 'sample': r['sample'],
+                             'df': r['df'], 'chi2': r['chi2'], 'p': r['p_fmt']})
+for _, r in h456_summary.iterrows():
+    if r['term'].startswith('H'):
+        master_rows.append({'hypothesis': r['term'], 'model': 'asym', 'sample': r['sample'],
+                             'df': r['df'], 'chi2': r['chi2'], 'p': r['p_fmt']})
+
+master = pd.DataFrame(master_rows).sort_values(['hypothesis', 'model', 'sample'])
+master
+```
+
+## 9. Dichotomous Thinking Inventory (Oshio, 2009)
+
+This section scores Oshio's Dichotomous Thinking Inventory and evaluates its reliability and factor structure in this sample.
+
+Oshio's (2009) DTI is 15 items on a 1 ("disagree strongly") to 6 ("agree strongly")
+scale, organized into three 5-item subscales:
+
+- **Preference for Dichotomy** (`dti_1`, `4`, `7`, `10`, `13`) — preference for clarity/distinctness over ambiguity.
+- **Dichotomous Belief** (`dti_2`, `5`, `8`, `11`, `14`) — the belief that things divide into all-or-nothing categories.
+- **Profit-and-Loss Thinking** (`dti_3`, `6`, `9`, `12`, `15`) — the drive to sort things into beneficial vs. not.
+
+The three subscales are interleaved in the item order rather than presented in
+blocks, so each subscale takes every third item.
+
+Each subscale score is the mean of its 5 items; the total DTI score is the mean of
+all 15. (Oshio's original paper sums rather than averages within each subscale —
+the two are linear transformations of each other, so this doesn't change any
+inferential result, only the scale participants' scores are reported on. Sums are
+also reported below for reference.)
+
+```{python}
+#| label: tbl-dti-items
+#| tbl-cap: "DTI items: summary statistics."
+
+dti_cols = [f'dti_{i}' for i in range(1, 16)]
+dti = df[dti_cols].apply(pd.to_numeric, errors='coerce')
+
+# subscales are interleaved: every third item belongs to the same dimension
+pref_items = [f'dti_{i}' for i in (1, 4, 7, 10, 13)]
+belief_items = [f'dti_{i}' for i in (2, 5, 8, 11, 14)]
+profitloss_items = [f'dti_{i}' for i in (3, 6, 9, 12, 15)]
+SUBSCALE_OF = ({i: 'Preference for Dichotomy' for i in (1, 4, 7, 10, 13)}
+               | {i: 'Dichotomous Belief' for i in (2, 5, 8, 11, 14)}
+               | {i: 'Profit-and-Loss Thinking' for i in (3, 6, 9, 12, 15)})
+
+dti.describe().T[['min', 'max', 'mean', 'std']]
+```
+
+### 9.1 Reliability
+
+```{python}
+#| label: tbl-dti-reliability
+#| tbl-cap: "DTI subscale reliability."
+
+def alpha_row(name, items):
+    a, ci = pg.cronbach_alpha(data=dti[items])
+    return {'subscale': name, 'n_items': len(items), 'alpha': a, 'ci_low': ci[0], 'ci_high': ci[1]}
+
+dti_alpha = pd.DataFrame([
+    alpha_row('Preference for Dichotomy', pref_items),
+    alpha_row('Dichotomous Belief', belief_items),
+    alpha_row('Profit-and-Loss Thinking', profitloss_items),
+    alpha_row('Total (15 items)', dti_cols),
+])
+dti_alpha
+```
+
+Reliability is good for Dichotomous Belief (α = .85) and acceptable for Preference
+for Dichotomy (α = .76) and Profit-and-Loss Thinking (α = .69) — broadly in line
+with what Oshio (2009) reported (α = .74-.81) for these short 5-item scales. The
+15-item total is the most reliable (α = .88).
+
+### 9.2 Exploratory factor analysis (validation)
+
+This re-derives factor structure from the current sample and compares it against
+the published item assignment, purely as a check — the composite scores used in
+the composite scores in §9.3 are computed from the fixed, published item set above,
+not from this exploratory solution.
+
+```{python}
+#| label: tbl-dti-efa
+#| tbl-cap: "DTI exploratory factor analysis: loadings."
+
+bartlett_chi2, bartlett_p = calculate_bartlett_sphericity(dti)
+kmo_per_item, kmo_overall = calculate_kmo(dti)
+print(f"Bartlett's test of sphericity: chi2 = {bartlett_chi2:.1f}, p = {bartlett_p:.3g}")
+print(f"KMO measure of sampling adequacy: {kmo_overall:.2f}")
+
+fa = FactorAnalyzer(n_factors=3, rotation='promax', method='ml')
+fa.fit(dti)
+loadings = pd.DataFrame(fa.loadings_, index=dti_cols, columns=['Factor 1', 'Factor 2', 'Factor 3'])
+loadings['a priori subscale'] = [SUBSCALE_OF[int(c.split('_')[1])] for c in loadings.index]
+loadings.round(2)
+```
+
+```{python}
+#| label: fig-dti-scree
+#| fig-cap: "DTI eigenvalues (scree)"
+
+ev, _ = fa.get_eigenvalues()
+fig, ax = plt.subplots(figsize=(5.4, 3.6))
+ax.plot(range(1, len(ev) + 1), ev, marker='o')
+ax.axhline(1, color='grey', linestyle='--', linewidth=1)
+ax.set_xlabel('Factor')
+ax.set_ylabel('Eigenvalue')
+ax.set_title('DTI scree plot')
+plt.tight_layout()
+plt.show()
+```
+
+The sample-derived solution recovers the published structure in part. **Preference
+for Dichotomy is clean**: all five of its items (1, 4, 7, 10, 13) load on the same
+factor. The other two subscales are less distinct — four of the five
+Profit-and-Loss items (3, 9, 12, 15) load on that *same* factor rather than
+separating, and Dichotomous Belief splits, with items 2, 5, and 14 on one factor
+and 8 and 11 on another.
+
+So the data support something closer to two dimensions than three: a broad
+clarity/decisiveness factor absorbing both Preference for Dichotomy and
+Profit-and-Loss, and a Dichotomous Belief factor. Partial recovery is a common
+finding when the DTI is used outside its original Japanese undergraduate sample.
+The a priori published grouping is still used for the composite scores below — the
+standard approach when applying an established scale — but it is worth knowing that
+Preference for Dichotomy and Profit-and-Loss may not be separable here.
+
+### 9.3 Composite scores
+
+```{python}
+#| label: tbl-dti-composites
+#| tbl-cap: "DTI composite scores."
+
+df['dti_pref_dichotomy'] = dti[pref_items].mean(axis=1)
+df['dti_dichotomous_belief'] = dti[belief_items].mean(axis=1)
+df['dti_profit_loss'] = dti[profitloss_items].mean(axis=1)
+df['dti_total'] = dti[dti_cols].mean(axis=1)
+
+df['dti_pref_dichotomy_sum'] = dti[pref_items].sum(axis=1)
+df['dti_dichotomous_belief_sum'] = dti[belief_items].sum(axis=1)
+df['dti_profit_loss_sum'] = dti[profitloss_items].sum(axis=1)
+df['dti_total_sum'] = dti[dti_cols].sum(axis=1)
+
+df[['dti_pref_dichotomy', 'dti_dichotomous_belief', 'dti_profit_loss', 'dti_total']].describe().T[['mean', 'std', 'min', 'max']]
+```
+
+These four composites (`dti_pref_dichotomy`, `dti_dichotomous_belief`,
+`dti_profit_loss`, `dti_total`) support the exploratory moderator analyses mentioned
+in the pre-registration's "Other" section — §9.4 uses them below. They are not
+entered into the H1-H6 models in §4-§7, since the pre-registration doesn't specify
+DTI as a fixed effect in those confirmatory models.
+
+### 9.4 Exploratory: does dichotomous thinking predict a narrower neutral zone?
+
+The intuition is straightforward: someone who sees the world in all-or-nothing terms
+should leave less room for "neither good nor bad," so a higher DTI score ought to go
+with a **narrower** neutral zone. This tests that, using the composites from §9.3 —
+Oshio's published item assignment, not the exploratory solution from §9.2.
+
+DTI is measured once per participant, so it is a person-level predictor. The outcome
+is each participant's neutral width **averaged across their three contexts**. Two
+versions are reported: a plain person-level correlation, and a mixed model on all
+observations that controls for business context and scale format and keeps the
+participant random intercept. This is **exploratory** — the pre-registration lists
+DTI under "Other" and does not specify it as a fixed effect in the H1-H6 models.
+
+```{python}
+#| label: tbl-dti-nw
+#| tbl-cap: "Does DTI predict neutral width? Person-level correlations with each participant's mean neutral width, and standardised mixed-model coefficients controlling for context and scale format. Positive values mean higher DTI goes with a WIDER neutral zone."
+
+DTI_VARS = {
+    'dti_total': 'Total DTI (15 items)',
+    'dti_pref_dichotomy': 'Preference for Dichotomy',
+    'dti_dichotomous_belief': 'Dichotomous Belief',
+    'dti_profit_loss': 'Profit-and-Loss Thinking',
+}
+dti_keep = ['response_id'] + list(DTI_VARS)
+
+dti_rows, dti_person = [], {}
+for sample_name, data in samples.items():
+    d_dti = data.merge(df[dti_keep], on='response_id', how='left')
+    person = (d_dti.groupby('response_id')
+                   .agg(nw_mean=('neutral_width_pct', 'mean'))
+                   .join(d_dti.groupby('response_id')[list(DTI_VARS)].first()))
+    dti_person[sample_name] = person
+    for v, label in DTI_VARS.items():
+        r, p_r = stats.pearsonr(person[v], person['nw_mean'])
+        dd = d_dti.copy()
+        dd['z_dti'] = (dd[v] - dd[v].mean()) / dd[v].std()
+        m = fit_mixedlm("neutral_width_pct ~ z_dti + C(context) + C(condition)", dd)
+        dti_rows.append({
+            'DTI score': label, 'sample': sample_name,
+            'n': len(person),
+            'r': round(r, 3), 'p (r)': fmt_p(p_r),
+            'b per SD': round(float(m.fe_params['z_dti']), 4),
+            'SE': round(float(m.bse['z_dti']), 4),
+            'p (mixed)': fmt_p(float(m.pvalues['z_dti'])),
+        })
+
+dti_nw_tbl = pd.DataFrame(dti_rows).set_index(['DTI score', 'sample'])
+dti_nw_tbl
+```
+
+```{python}
+#| label: fig-dti-nw
+#| fig-cap: "Left: each participant's mean neutral width against their total DTI score, with a least-squares fit. Right: the same relationship split into its two competing components - the share of responses given no neutral zone at all (red line, right axis) and the mean width (bars, left axis) both overall and among responses that did use a neutral zone."
+#| fig-width: 6.8
+#| fig-height: 3.4
+
+_d = samples['Bot-excluded sample'].merge(df[dti_keep], on='response_id', how='left')
+_d['zero'] = (_d['neutral_width_pct'] == 0).astype(int)
+_d['q'] = pd.qcut(_d['dti_total'], 4, labels=['Q1\n(lowest)', 'Q2', 'Q3', 'Q4\n(highest)'])
+qt = _d.groupby('q', observed=True).agg(
+    zero_rate=('zero', 'mean'),
+    nw_mean=('neutral_width_pct', 'mean'),
+    nw_nonzero=('neutral_width_pct', lambda x: x[x > 0].mean()))
+
+pers = dti_person['Bot-excluded sample']
+fig, axes = plt.subplots(1, 2, figsize=(6.8, 3.4))
+
+ax = axes[0]
+ax.scatter(pers['dti_total'], pers['nw_mean'], s=7, alpha=0.25,
+           color='#4a7fb5', edgecolors='none')
+_slope, _icpt = np.polyfit(pers['dti_total'], pers['nw_mean'], 1)
+_xs = np.linspace(pers['dti_total'].min(), pers['dti_total'].max(), 50)
+ax.plot(_xs, _icpt + _slope * _xs, color='crimson', linewidth=2)
+ax.set_xlabel('Total DTI score', fontsize=8)
+ax.set_ylabel("Mean neutral width", fontsize=8)
+ax.set_title(f'Person level (n = {len(pers)})', fontsize=9)
+ax.tick_params(labelsize=8)
+
+ax = axes[1]
+x = np.arange(len(qt))
+ax.bar(x - 0.19, qt['nw_mean'], width=0.38, color='#9ecae1', label='Mean width (all)')
+ax.bar(x + 0.19, qt['nw_nonzero'], width=0.38, color='#3182bd', label='Mean width | > 0')
+ax.set_xticks(x); ax.set_xticklabels(qt.index, fontsize=7.5)
+ax.set_xlabel('DTI quartile', fontsize=8)
+ax.set_ylabel('Neutral width (0-1)', fontsize=8)
+ax.tick_params(axis='y', labelsize=8)
+ax2 = ax.twinx()
+ax2.plot(x, qt['zero_rate'] * 100, color='crimson', marker='o', linewidth=1.8,
+         label='% with no neutral zone')
+ax2.set_ylabel('% giving no neutral zone', color='crimson', fontsize=8)
+ax2.tick_params(axis='y', labelcolor='crimson', labelsize=8)
+ax2.grid(False)
+ax2.set_ylim(0, qt['zero_rate'].max() * 100 * 1.6)
+h1, l1 = ax.get_legend_handles_labels()
+h2, l2 = ax2.get_legend_handles_labels()
+ax.legend(h1 + h2, l1 + l2, fontsize=6.5, loc='upper left', framealpha=0.9)
+ax.set_title('By DTI quartile', fontsize=9)
+
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+#| label: dti-nw-decomposition
+
+_pm = _d.groupby('response_id').agg(zero_rate=('zero', 'mean'),
+                                    dti=('dti_total', 'first'))
+_nz = (_d.loc[_d['neutral_width_pct'] > 0]
+         .groupby('response_id')
+         .agg(nw=('neutral_width_pct', 'mean'), dti=('dti_total', 'first')))
+_r1, _p1 = stats.pearsonr(_pm['dti'], _pm['zero_rate'])
+_r2, _p2 = stats.pearsonr(_nz['dti'], _nz['nw'])
+
+# randomisation check: DTI should not differ by scale format
+_groups = [g['dti_total'].values for _, g in _d.groupby('condition', observed=True)]
+_F, _pF = stats.f_oneway(*_groups)
+
+print(f"DTI vs P(no neutral zone)      : r = {_r1:+.3f}, p = {_p1:.4f}  (n = {len(_pm)})")
+print(f"DTI vs mean width | width > 0  : r = {_r2:+.3f}, p = {_p2:.4f}  (n = {len(_nz)})")
+print(f"DTI balanced across formats    : F(5, {len(_d)-6}) = {_F:.2f}, p = {_pF:.3f}")
+```
+
+**The prediction is not supported — and the reliable effect runs the other way.**
+Higher DTI scorers set *wider* neutral zones, not narrower ones. The total-score
+correlation is r = +.11 (p = .003), and the mixed model puts it at **+0.019 of the
+0-1 scale per SD of DTI** (p = .002) after controlling for context and format. All
+three subscales point the same direction; Dichotomous Belief is the strongest and
+Preference for Dichotomy the weakest. The full and bot-excluded samples agree
+throughout.
+
+The right-hand panel of @fig-dti-nw shows why the headline number understates what is
+actually going on, because **two opposing behaviours are being averaged together**:
+
+- High scorers are **about twice as likely to give no neutral zone at all** — the
+  zero-width rate climbs from 7.3% in the lowest DTI quartile to 14.8% in the
+  highest (r = +.10 at the person level). That is the dichotomous-thinking
+  prediction, and it holds.
+- But when they *do* mark a neutral zone, it is **substantially wider** — a mean of
+  0.361 in the top quartile against 0.271 in the bottom (r = +.16 among non-zero
+  responses). This is the larger of the two effects, so it decides the average.
+
+So dichotomous thinking here looks less like "uniformly less middle ground" and more
+like a **more polarised use of the middle**: either there is no grey area at all, or
+the grey area is broad. A single mean cannot express that, which is why the
+prediction as originally framed comes out backwards.
+
+Three cautions before this gets any weight. It is **exploratory and unregistered**,
+so it should be treated as hypothesis-generating. The **effect is small** — r = +.11
+is about 1% of the variance in mean neutral width, and with n = 748 here it is
+correspondingly less precisely estimated than in the six-format analysis. And §9.2
+found the DTI's
+published three-factor structure only **partly replicates** in this sample, with
+Preference for Dichotomy and Profit-and-Loss failing to separate — which is worth
+remembering given that those are two of the three subscales in the table above.
+
+What is *not* a concern is confounding with scale format: DTI is balanced across the
+six formats (the randomisation check printed above), and the person-level
+correlation is positive within every one of them.
+
+### 9.5 Robustness: a composite built from this sample's own factor structure
+
+§9.4 scored the DTI the standard way, using Oshio's published item assignment. But
+§9.2 showed that assignment only partly replicates here, so the natural robustness
+question is whether the §9.4 result survives scoring the scale **empirically** —
+assigning each item to whichever factor it actually loads on in this sample.
+
+Two empirical scorings are built from the same 3-factor promax solution already
+fitted in §9.2. The first assigns each item to its highest-loading factor and takes
+an unweighted mean, which is directly comparable to the published composites. The
+second uses **regression factor scores**, which weight every item by its loading
+rather than assigning it to one factor at all.
+
+```{python}
+#| label: tbl-dti-empirical-structure
+#| tbl-cap: "Empirical item assignment from this sample's 3-factor solution, against Oshio's published assignment. Each item goes to the factor it loads on most strongly."
+
+FCOLS = ['Factor 1', 'Factor 2', 'Factor 3']
+emp = loadings[FCOLS].copy()
+# promax factor signs are arbitrary; orient each so its dominant loadings are positive
+for c in FCOLS:
+    if emp[c].sum() < 0:
+        emp[c] = -emp[c]
+
+emp['assigned'] = emp[FCOLS].abs().idxmax(axis=1)
+emp['loading'] = emp[FCOLS].abs().max(axis=1).round(3)
+emp['published subscale'] = loadings['a priori subscale']
+
+EMP_ITEMS = {f: emp.index[emp['assigned'] == f].tolist() for f in FCOLS}
+EMP_LABELS = {
+    'Factor 1': 'E1: broad dichotomy preference',
+    'Factor 2': 'E2: dichotomous belief (core)',
+    'Factor 3': 'E3: mixed belief / profit-loss',
+}
+
+print("Empirical clusters and their internal consistency:")
+for f in FCOLS:
+    items = EMP_ITEMS[f]
+    a = pg.cronbach_alpha(data=dti[items])[0] if len(items) > 1 else float('nan')
+    pubs = sorted(set(loadings.loc[items, 'a priori subscale']))
+    print(f"  {EMP_LABELS[f]:32s} {len(items):2d} items  alpha = {a:.3f}")
+    print(f"      {', '.join(items)}")
+    print(f"      drawn from: {'; '.join(pubs)}")
+
+emp[['published subscale', 'assigned', 'loading']]
+```
+
+```{python}
+#| label: tbl-dti-score2
+#| tbl-cap: "The §9.4 prediction re-run with composites derived from this sample's own factor structure. The published total DTI is repeated as a reference row. Positive values mean higher scores go with a WIDER neutral zone."
+
+# unit-weighted empirical composites
+for f in FCOLS:
+    df[f'dti2_{f[-1]}'] = dti[EMP_ITEMS[f]].mean(axis=1)
+
+# regression factor scores, sign-oriented to match
+_fs = fa.transform(dti)
+for j, f in enumerate(FCOLS):
+    v = _fs[:, j]
+    if loadings[f].sum() < 0:
+        v = -v
+    df[f'dti2_fscore_{f[-1]}'] = v
+
+DTI2_VARS = {'dti_total': 'Total DTI (published, 15 items)'}
+DTI2_VARS |= {f'dti2_{f[-1]}': EMP_LABELS[f] + ' (unit-weighted)' for f in FCOLS}
+DTI2_VARS |= {f'dti2_fscore_{f[-1]}': EMP_LABELS[f] + ' (factor score)' for f in FCOLS}
+
+dti2_keep = ['response_id'] + list(DTI2_VARS)
+dti2_rows, _fullr = [], []
+for sample_name, data in samples.items():
+    dd0 = data.merge(df[dti2_keep], on='response_id', how='left')
+    per = (dd0.groupby('response_id').agg(nw_mean=('neutral_width_pct', 'mean'))
+              .join(dd0.groupby('response_id')[list(DTI2_VARS)].first()))
+    for v, label in DTI2_VARS.items():
+        r, p_r = stats.pearsonr(per[v], per['nw_mean'])
+        dd = dd0.copy()
+        dd['z_dti'] = (dd[v] - dd[v].mean()) / dd[v].std()
+        m = fit_mixedlm("neutral_width_pct ~ z_dti + C(context) + C(condition)", dd)
+        row = {'composite': label, 'r': round(r, 3), 'p (r)': fmt_p(p_r),
+               'b per SD': round(float(m.fe_params['z_dti']), 4),
+               'SE': round(float(m.bse['z_dti']), 4),
+               'p (mixed)': fmt_p(float(m.pvalues['z_dti']))}
+        if sample_name == 'Bot-excluded sample':
+            dti2_rows.append(row)
+        else:
+            _fullr.append(r)
+
+print(f"Full sample gives the same picture: all r between {min(_fullr):+.3f} "
+      f"and {max(_fullr):+.3f}, every one positive.")
+
+pd.DataFrame(dti2_rows).set_index('composite')
+```
+
+**The §9.4 conclusion is robust to how the scale is scored.** Every empirically
+derived composite reproduces the same positive relationship — higher dichotomous
+thinking, *wider* neutral zone — and every one is significant in the mixed model.
+Nothing about the direction depends on using Oshio's published groupings.
+
+Two details worth noting, though neither changes the verdict:
+
+- **Unit-weighted and factor-score versions are interchangeable here.** They
+  correlate .96-.99 with each other and give effectively identical coefficients, so
+  the loading-weighting adds nothing over simply averaging the assigned items.
+- **The broad factor is the weakest predictor, not the strongest.** E1 is the
+  9-item cluster that swallows all of Preference for Dichotomy plus most of
+  Profit-and-Loss, and it produces the smallest effect (r = +.08) despite having the
+  most items. The two small three-item clusters do better (r = +.12 and +.10). That
+  echoes §9.4, where published Preference for Dichotomy was the weakest subscale and
+  Dichotomous Belief the strongest: whatever is driving the neutral-width
+  relationship sits in the *belief* content, not in the general
+  clarity-and-decisiveness content that dominates the item pool.
+
+## 10. Encounter and use across business contexts
+
+This section describes how often participants report encountering and using ratings in each of the three business contexts, and tests whether those reports vary by context.
+
+Six items were collected, one encounter item and one use item for each context, each
+answered on a 1-5 scale with higher meaning more frequent. Because every participant
+answered all six, context can be compared **within participant**.
+
+```{python}
+#| label: tbl-eu-descriptives
+#| tbl-cap: "Encounter and use scores by business context: means, standard deviations, and variances. All items are on the same 1-5 scale, so the values are directly comparable across rows."
+
+EU_MAP = {'doctor': ('dr_encounter', 'dr_use'),
+          'isp': ('isp_encounter', 'isp_use'),
+          'restaurant': ('rest_encounter', 'rest_use')}
+
+_eu_rows = []
+for _ctx, (_e, _u) in EU_MAP.items():
+    for _kind, _col in (('Encounter', _e), ('Use', _u)):
+        _eu_rows.append(pd.DataFrame({
+            'response_id': df['response_id'], 'context': _ctx, 'kind': _kind,
+            'score': pd.to_numeric(df[_col], errors='coerce')}))
+eu_long = pd.concat(_eu_rows, ignore_index=True)
+
+eu_desc = eu_long.groupby(['context', 'kind'])['score'].agg(
+    n='size', mean='mean', SD='std', variance='var', median='median')
+eu_desc['SE'] = eu_desc['SD'] / np.sqrt(eu_desc['n'])
+eu_desc.round(3)
+```
+
+```{python}
+#| label: fig-eu-context
+#| fig-cap: "Left: mean encounter and use score by business context, with 95% CIs. Right: the spread of those same scores, as the standard deviation within each context and item type. Restaurant is both the highest-scoring and the least variable context."
+#| fig-width: 6.8
+#| fig-height: 3.2
+
+_ctx_order = ['doctor', 'isp', 'restaurant']
+fig, axes = plt.subplots(1, 2, figsize=(6.8, 3.2))
+_x = np.arange(len(_ctx_order))
+_cols = {'Encounter': '#4a7fb5', 'Use': '#e08a4a'}
+
+for _kind, _c in _cols.items():
+    _sub = eu_desc.xs(_kind, level='kind').reindex(_ctx_order)
+    axes[0].errorbar(_x, _sub['mean'], yerr=1.96 * _sub['SE'], marker='o',
+                     capsize=4, color=_c, label=_kind, linewidth=1.6)
+axes[0].set_xticks(_x); axes[0].set_xticklabels(_ctx_order, fontsize=8)
+axes[0].set_ylabel('Mean score (1-5)', fontsize=8)
+axes[0].set_xlabel('Business context', fontsize=8)
+axes[0].set_title('Means (±95% CI)', fontsize=9)
+axes[0].legend(fontsize=8)
+axes[0].tick_params(labelsize=8)
+
+_w = 0.38
+for _i, (_kind, _c) in enumerate(_cols.items()):
+    _sub = eu_desc.xs(_kind, level='kind').reindex(_ctx_order)
+    axes[1].bar(_x + (_i - 0.5) * _w, _sub['SD'], width=_w, color=_c, label=_kind)
+axes[1].set_xticks(_x); axes[1].set_xticklabels(_ctx_order, fontsize=8)
+axes[1].set_ylabel('SD of score', fontsize=8)
+axes[1].set_xlabel('Business context', fontsize=8)
+axes[1].set_title('Spread', fontsize=9)
+axes[1].tick_params(labelsize=8)
+
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+#| label: tbl-eu-tests
+#| tbl-cap: "Omnibus tests for the encounter/use scores: whether they differ by business context, by item type, and whether the encounter-use gap itself depends on context."
+
+eu_fit = fit_mixedlm("score ~ C(context) * C(kind)", eu_long)
+eu_terms = {'C(context)': 'Business context',
+            'C(kind)': 'Item type (encounter vs use)',
+            'C(context):C(kind)': 'Context x item type'}
+eu_wald = wald_table(eu_fit, eu_terms)
+eu_wald['p'] = eu_wald['p'].apply(fmt_p)
+
+_s2e, _s2u = eu_fit.scale, float(eu_fit.cov_re.iloc[0, 0])
+print(f"Participant random intercept: ICC = {_s2u / (_s2u + _s2e):.3f} "
+      f"(sigma2_u = {_s2u:.3f}, sigma2_e = {_s2e:.3f})")
+eu_wald
+```
+
+```{python}
+#| label: tbl-eu-pairwise
+#| tbl-cap: "Pairwise context comparisons within each item type. Paired tests, since every participant answered all three contexts; p-values Holm-adjusted within item type. dz is the paired effect size."
+
+_pair_rows = []
+for _kind in ['Encounter', 'Use']:
+    _w = eu_long[eu_long['kind'] == _kind].pivot(
+        index='response_id', columns='context', values='score')
+    _raw, _meta = [], []
+    for _a, _b in [('doctor', 'isp'), ('doctor', 'restaurant'), ('isp', 'restaurant')]:
+        _t, _p = stats.ttest_rel(_w[_a], _w[_b])
+        _d = _w[_a] - _w[_b]
+        _raw.append(_p)
+        _meta.append((_a, _b, _d.mean(), _d.mean() / _d.std()))
+    _adj = pg.multicomp(_raw, method='holm')[1]
+    for (_a, _b, _md, _dz), _pa in zip(_meta, _adj):
+        _pair_rows.append({'item type': _kind, 'comparison': f'{_a} - {_b}',
+                           'mean diff': round(_md, 3), 'dz': round(_dz, 3),
+                           'p (Holm)': fmt_p(_pa)})
+
+pd.DataFrame(_pair_rows).set_index(['item type', 'comparison'])
+```
+
+```{python}
+#| label: tbl-eu-consistency
+#| tbl-cap: "Is familiarity a stable trait or context-specific? Correlations between contexts for the same item type, plus how much a participant's own scores move across contexts."
+
+_cons_rows = []
+for _kind in ['Encounter', 'Use']:
+    _w = eu_long[eu_long['kind'] == _kind].pivot(
+        index='response_id', columns='context', values='score')
+    _c = _w.corr()
+    _pairs = [('doctor', 'isp'), ('doctor', 'restaurant'), ('isp', 'restaurant')]
+    _wsd = _w.std(axis=1)
+    _cons_rows.append({
+        'item type': _kind,
+        'r doctor-isp': round(_c.loc['doctor', 'isp'], 3),
+        'r doctor-restaurant': round(_c.loc['doctor', 'restaurant'], 3),
+        'r isp-restaurant': round(_c.loc['isp', 'restaurant'], 3),
+        'mean r': round(np.mean([_c.loc[a, b] for a, b in _pairs]), 3),
+        'mean within-person SD': round(_wsd.mean(), 3),
+        '% identical across contexts': round((_wsd == 0).mean() * 100, 1),
+    })
+
+# per-context familiarity score = mean of that context's encounter and use items
+for _ctx, (_e, _u) in EU_MAP.items():
+    df[f'{_ctx}_familiarity'] = df[[_e, _u]].apply(pd.to_numeric, errors='coerce').mean(axis=1)
+
+pd.DataFrame(_cons_rows).set_index('item type')
+```
+
+**Both scores vary strongly by context, and the pattern is not the same for the two
+item types.** Context is overwhelmingly the largest effect (@tbl-eu-tests), item
+type is a small main effect, and the **context x item type interaction is
+significant** — meaning the gap between encountering ratings and using them is
+itself context-dependent.
+
+Reading the numbers:
+
+- **Restaurant dominates.** It is the highest-scoring context on both items
+  (encounter 4.51, use 4.20) and, by a wide margin, the **least variable** (variance
+  0.50 and 0.80, against 1.01-1.43 elsewhere). Nearly everyone reports encountering
+  and using restaurant ratings, so there is little room left for individual
+  differences — a compression that is worth remembering if these scores are ever
+  used as a moderator, since a near-ceiling variable has limited power to moderate
+  anything.
+- **Doctor and ISP separate only on *use*.** Their encounter scores are
+  statistically indistinguishable (3.73 vs 3.78, Holm-adjusted p = .10), but people
+  report *using* doctor ratings more than ISP ratings (3.64 vs 3.40, p < .001). ISP
+  has the largest encounter-use gap of the three contexts (+0.38), doctor the
+  smallest (+0.08). That is the interaction: people run into ISP ratings about as
+  often as doctor ratings but act on them less.
+- **Encounter exceeds use everywhere**, which is the expected direction — you cannot
+  use a rating you never encounter — but the size of that gap is what distinguishes
+  the contexts.
+
+**Familiarity is context-specific, not a general trait.** Between-context
+correlations for the same item type are low (@tbl-eu-consistency: r = .22-.33 for
+encounter, .30-.38 for use), the participant random intercept accounts for only
+about 28% of the variance, and only 15-21% of participants give identical scores
+across all three contexts. Knowing someone reads restaurant reviews tells you
+relatively little about whether they read ISP reviews. Any familiarity measure used
+downstream should therefore be **per-context** rather than a single omnibus score;
+the three per-context scores (`doctor_familiarity`, `isp_familiarity`,
+`restaurant_familiarity`, each the mean of that context's encounter and use items)
+are computed above and attached to `df`.
